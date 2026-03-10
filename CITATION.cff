@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "cf-lib: Nearest-Neighbour Multimodal Counterfactual Generation Library"
+abstract: >
+  cf-lib is a Python library for generating nearest-neighbour counterfactual
+  explanations for multimodal classifiers. It supports tabular, time-series,
+  and text modalities, and provides unimodal generators (TabularNN,
+  TimeSeriesNN, TextNN) as well as multimodal strategies (EarlyFusionNN,
+  IntermediateFusionNN, FrankensteinNN, CombinedNN).
+authors:
+  - family-names: "LAST_NAME"       # TODO: replace
+    given-names: "FIRST_NAME"       # TODO: replace
+    affiliation: "YOUR INSTITUTION" # TODO: replace
+    orcid: "https://orcid.org/XXXX-XXXX-XXXX-XXXX"  # TODO: replace or remove
+date-released: "2025-01-01"         # TODO: update to actual release date
+version: "0.1.0"
+license: Apache-2.0
+repository-code: "https://github.com/YOUR_USERNAME/cf-lib"  # TODO: replace
+keywords:
+  - counterfactual explanations
+  - explainability
+  - multimodal
+  - nearest neighbours
+  - time series
+  - natural language processing

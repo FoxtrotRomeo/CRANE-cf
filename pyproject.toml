@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "cf-lib"
+version = "0.1.0"
+description = "Nearest-neighbour multimodal counterfactual generation library"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+
+# Core runtime dependencies
+dependencies = [
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "aeon>=0.9",          # DTW and other time-series distances
+]
+
+[project.optional-dependencies]
+# Text encoders (E5 / BERT / Word2Vec)
+text = [
+    "transformers>=4.35",
+    "torch>=2.0",
+    "gensim>=4.3",
+    "rouge-score>=0.1",
+    "nltk>=3.8",
+]
+# Intermediate-Fusion generator (needs a Keras model)
+model = [
+    "keras>=3.0",
+]
+# Everything
+all = [
+    "cf-lib[text,model]",
+]
+# Development
+dev = [
+    "pytest>=7",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cf_lib*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
