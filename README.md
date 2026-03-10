@@ -17,7 +17,7 @@ provides several combination strategies.
 Clone the repository and install the core dependencies:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cf-lib.git
+git clone https://github.com/FoxtrotRomeo/cf-lib.git
 cd cf-lib
 pip install .
 ```
