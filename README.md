@@ -151,6 +151,7 @@ Run from the **repository root**:
 # Smoke test with synthetic data (includes image embeddings)
 python examples/run_distance_ablation.py \
   --factory ablation_factory_template:build_synthetic_dataset_and_model \
+  --n-jobs 2 \
   --max-combinations 5 \
   --max-samples 3
 
@@ -160,6 +161,7 @@ python examples/run_distance_ablation.py \
   --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "load_image": true, "image_encoder": "resnet50"}' \
   --image-encoders resnet50 \
   --image-distance-metrics cosine,euclidean \
+  --n-jobs 4 \
   --output-dir ablation_runs \
   --max-samples 25
 ```
@@ -192,7 +194,8 @@ candidate: `outcome`, `proximity`, `sparsity`, and `plausibility`.
 
 `examples/run_distance_ablation.py` can also attach objective summaries to
 each ablation row via `objectives_kwargs` or
-`objectives_kwargs_factory(text_cfg, image_cfg)`.
+`objectives_kwargs_factory(text_cfg, image_cfg)`. Use `--n-jobs` to run
+multiple ablation combinations concurrently when your backend resources allow it.
 
 ---
 

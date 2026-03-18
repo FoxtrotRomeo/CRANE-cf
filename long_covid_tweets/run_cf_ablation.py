@@ -69,6 +69,8 @@ parser.add_argument("--max-samples",     type=int,   default=None,
                     help="Cap on how many sadness samples to process (default: all).")
 parser.add_argument("--max-combinations",type=int,   default=None,
                     help="Cap on metric combinations to try (default: all).")
+parser.add_argument("--n-jobs",          type=int,   default=1,
+                    help="Number of ablation combinations to run in parallel.")
 parser.add_argument("--output-dir",      type=str,   default="data/ablation_runs")
 parser.add_argument("--run-name",        type=str,   default=None)
 parser.add_argument("--save-full",       action="store_true",
@@ -448,7 +450,7 @@ def _metric_to_static_dist_fn(metric: str):
 # encoder used for search → same encoder for evaluation;
 # "raw" search → tfidf for evaluation.
 # ---------------------------------------------------------------------------
-def _objectives_kwargs_factory(text_cfg):
+def _objectives_kwargs_factory(text_cfg, image_cfg):
     """Return compute_objectives kwargs matched to this combo's text encoder."""
     encoder = (text_cfg or {}).get("encoder", "raw")
 
@@ -477,7 +479,14 @@ def _objectives_kwargs_factory(text_cfg):
 # ---------------------------------------------------------------------------
 _k_search = min(50, args.k * 5)
 
-def _multimodal_generators_factory(tab_cfg, ts_cfg, text_cfg, text_backend_kwargs):
+def _multimodal_generators_factory(
+    tab_cfg,
+    ts_cfg,
+    text_cfg,
+    text_backend_kwargs,
+    image_cfg,
+    image_backend_kwargs,
+):
     """Build Frankenstein, Combined, and EarlyFusion generators for this combo."""
     encoder       = (text_cfg or {}).get("encoder", "raw")
     tab_metric    = (tab_cfg  or {}).get("__primary__", "euclidean")
@@ -523,6 +532,7 @@ print(f"\nRunning distance ablation …")
 print(f"  Samples : {len(sadness_indices)} (predicted '{label_classes[source_value]}')")
 print(f"  Target  : {joy_value} ({label_classes[joy_value]})")
 print(f"  k       : {args.k}")
+print(f"  n_jobs  : {args.n_jobs}")
 print(f"  Tab metrics   : {tab_metrics}")
 print(f"  Text encoders : {text_encoders}")
 print()
@@ -543,6 +553,7 @@ run_distance_ablation(
     run_name                  = args.run_name,
     save_full                 = args.save_full,
     max_combinations          = args.max_combinations,
+    n_jobs                    = args.n_jobs,
     objectives_kwargs_factory = _objectives_kwargs_factory,
     extra_generators_factory  = _multimodal_generators_factory,
 )
