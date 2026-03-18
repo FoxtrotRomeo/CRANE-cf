@@ -9,14 +9,14 @@ abstract: >
   TimeSeriesNN, TextNN) as well as multimodal strategies (EarlyFusionNN,
   IntermediateFusionNN, FrankensteinNN, CombinedNN).
 authors:
-  - family-names: "LAST_NAME"       # TODO: replace
-    given-names: "FIRST_NAME"       # TODO: replace
-    affiliation: "YOUR INSTITUTION" # TODO: replace
-    orcid: "https://orcid.org/XXXX-XXXX-XXXX-XXXX"  # TODO: replace or remove
-date-released: "2025-01-01"         # TODO: update to actual release date
+  - family-names: "Rugolon"
+    given-names: "Franco"
+    affiliation: "Stockholm University, Department of Computer and Systems Sciences"
+    orcid: "https://orcid.org/0000-0002-7693-0576"
+date-released: "2026-03-10"
 version: "0.1.0"
 license: Apache-2.0
-repository-code: "https://github.com/YOUR_USERNAME/cf-lib"  # TODO: replace
+repository-code: "https://github.com/FoxtrotRomeo/cf-lib"
 keywords:
   - counterfactual explanations
   - explainability

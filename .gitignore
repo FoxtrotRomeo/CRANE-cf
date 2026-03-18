@@ -22,6 +22,7 @@ env/
 *.ipynb
 
 # Data and model artefacts — do not commit large binaries
+data/
 *.npy
 *.npz
 *.pkl
@@ -51,3 +52,7 @@ htmlcov/
 # Type checking
 .mypy_cache/
 .ruff_cache/
+
+# Claude
+CLAUDE.md
+METHODS_RECORD.md
