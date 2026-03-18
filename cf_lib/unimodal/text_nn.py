@@ -41,6 +41,9 @@ class TextNN(CounterfactualGenerator):
                         : TF-IDF backend configuration
     word2vec_model/word2vec_embed_fn
                         : Word2Vec backend configuration
+    precomputed_train_text_embeddings / precomputed_test_text_embeddings
+                        : optional 2-D arrays reused instead of re-embedding
+                          the full train/test text splits for vector encoders
     text_metric_kwargs  : optional kwargs for direct text metrics
     text_repr_fn        : optional callable(raw_text) -> str that converts each entry in
                           X_train/test_text to plain string. When ``None`` the
@@ -68,6 +71,8 @@ class TextNN(CounterfactualGenerator):
         tfidf_kwargs: Optional[Dict[str, Any]] = None,
         word2vec_model=None,
         word2vec_embed_fn: Optional[Callable] = None,
+        precomputed_train_text_embeddings=None,
+        precomputed_test_text_embeddings=None,
         text_metric_kwargs: Optional[Dict[str, Any]] = None,
         text_repr_fn: Optional[Callable] = None,
     ):
@@ -90,6 +95,8 @@ class TextNN(CounterfactualGenerator):
         self.tfidf_kwargs = tfidf_kwargs
         self.word2vec_model = word2vec_model
         self.word2vec_embed_fn = word2vec_embed_fn
+        self.precomputed_train_text_embeddings = precomputed_train_text_embeddings
+        self.precomputed_test_text_embeddings = precomputed_test_text_embeddings
         self.text_metric_kwargs = text_metric_kwargs
         self.text_repr_fn = text_repr_fn
 
@@ -250,6 +257,8 @@ class TextNN(CounterfactualGenerator):
             word2vec_model=self.word2vec_model,
             train_text_raw=dataset.X_train_text,
             test_text_raw=dataset.X_test_text,
+            precomputed_train_embeddings=self.precomputed_train_text_embeddings,
+            precomputed_test_embeddings=self.precomputed_test_text_embeddings,
         )
 
         candidates = self._materialize(

@@ -22,6 +22,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 
+from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
+
 def _validate_k(k: int) -> int:
     k_int = int(k)
     if k_int < 1:
@@ -795,26 +797,28 @@ def _embed_bert_mean_pool(
         raise ValueError("BERT encoding requires tokenizer and model.")
 
     device_obj = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device_obj)
-    model.eval()
 
-    embeddings = []
-    with torch.no_grad():
-        for start in range(0, len(texts), int(batch_size)):
-            batch = texts[start : start + int(batch_size)]
-            enc = tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=int(max_length),
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device_obj) for k, v in enc.items()}
-            out = model(**enc)
-            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-            mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-12)
-            embeddings.append(pooled.cpu().numpy())
+    with _HF_BACKEND_LOCK:
+        model = model.to(device_obj)
+        model.eval()
+
+        embeddings = []
+        with torch.no_grad():
+            for start in range(0, len(texts), int(batch_size)):
+                batch = texts[start : start + int(batch_size)]
+                enc = tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=int(max_length),
+                    return_tensors="pt",
+                )
+                enc = {k: v.to(device_obj) for k, v in enc.items()}
+                out = model(**enc)
+                hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+                mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-12)
+                embeddings.append(pooled.cpu().numpy())
 
     return np.concatenate(embeddings, axis=0) if embeddings else np.empty((0, 0), dtype=float)
 
@@ -1166,8 +1170,19 @@ def _build_text_representations(
     tfidf_kwargs=None,
     word2vec_embed_fn=None,
     word2vec_model=None,
+    precomputed_train_embeddings=None,
+    precomputed_test_embeddings=None,
 ):
     enc = _normalize_text_encoder(text_encoder, default="e5")
+
+    if precomputed_train_embeddings is not None or precomputed_test_embeddings is not None:
+        if precomputed_train_embeddings is None or precomputed_test_embeddings is None:
+            raise ValueError(
+                "Provide both precomputed_train_embeddings and precomputed_test_embeddings."
+            )
+        emb_train = np.asarray(precomputed_train_embeddings, dtype=float)
+        emb_test = np.asarray(precomputed_test_embeddings, dtype=float)
+        return emb_train, emb_test
 
     if enc == "raw":
         raise ValueError("Raw-text encoder does not produce vectors. Use direct text metrics.")
@@ -1280,6 +1295,8 @@ def find_k_closest_text(
     word2vec_model=None,
     train_text_raw=None,
     test_text_raw=None,
+    precomputed_train_embeddings=None,
+    precomputed_test_embeddings=None,
 ):
     # X_train_static and X_test_static are optional (may be None when the
     # dataset has no tabular features). n_train / n_test are inferred from
@@ -1417,6 +1434,8 @@ def find_k_closest_text(
             tfidf_kwargs=tfidf_kwargs,
             word2vec_embed_fn=word2vec_embed_fn,
             word2vec_model=word2vec_model,
+            precomputed_train_embeddings=precomputed_train_embeddings,
+            precomputed_test_embeddings=precomputed_test_embeddings,
         )
         if emb_train.ndim != 2 or emb_test.ndim != 2:
             raise ValueError("Text representations must be 2D arrays: (N, D).")

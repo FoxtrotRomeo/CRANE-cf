@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import importlib
 import inspect
 import itertools
@@ -113,6 +114,16 @@ def _call_factory_compat(fn, *args):
         if p.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
     ]
     return fn(*args[: len(positional_params)])
+
+
+def _limit_worker_threads(max_threads: Optional[int]):
+    if max_threads is None:
+        return contextlib.nullcontext()
+    try:
+        from threadpoolctl import threadpool_limits
+    except Exception:
+        return contextlib.nullcontext()
+    return threadpool_limits(limits=max(1, int(max_threads)))
 
 
 def _infer_n_test(dataset) -> int:
@@ -312,6 +323,12 @@ def _build_generators_for_combo(
             text_distance_metric=text_cfg["metric"],
         )
         text_kwargs.update(_filter_kwargs_for_callable(TextNN.__init__, text_backend_kwargs))
+        precomputed_by_encoder = text_backend_kwargs.get("precomputed_text_embeddings_by_encoder")
+        if isinstance(precomputed_by_encoder, dict):
+            precomputed = precomputed_by_encoder.get(text_cfg["encoder"])
+            if isinstance(precomputed, dict):
+                text_kwargs["precomputed_train_text_embeddings"] = precomputed.get("train")
+                text_kwargs["precomputed_test_text_embeddings"] = precomputed.get("test")
         generators["Text"] = TextNN(**text_kwargs)
 
     # Image modality (optional)
@@ -434,6 +451,7 @@ def _run_ablation_combo(
     objectives_kwargs: Optional[Dict[str, Any]],
     objectives_kwargs_factory: Optional[Any],
     extra_generators_factory: Optional[Any],
+    worker_threads_limit: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
     row = {
         "combo_id": combo_id,
@@ -458,56 +476,58 @@ def _run_ablation_combo(
     t0 = time.time()
     results = {}
     try:
-        generators = _build_generators_for_combo(
-            k=k,
-            tab_metrics_by_name=tab_cfg,
-            ts_metrics_by_name=ts_cfg,
-            text_cfg=text_cfg,
-            text_backend_kwargs=text_backend_kwargs,
-            image_cfg=image_cfg,
-            image_backend_kwargs=image_backend_kwargs,
-        )
-        if extra_generators_factory is not None:
-            extras = _call_factory_compat(
-                extra_generators_factory,
-                tab_cfg,
-                ts_cfg,
-                text_cfg,
-                text_backend_kwargs,
-                image_cfg,
-                image_backend_kwargs,
+        with _limit_worker_threads(worker_threads_limit):
+            generators = _build_generators_for_combo(
+                k=k,
+                tab_metrics_by_name=tab_cfg,
+                ts_metrics_by_name=ts_cfg,
+                text_cfg=text_cfg,
+                text_backend_kwargs=text_backend_kwargs,
+                image_cfg=image_cfg,
+                image_backend_kwargs=image_backend_kwargs,
             )
-            if extras:
-                generators.update(extras)
-        lib = CounterfactualLibrary(generators=generators)
-        results = lib.generate_batch(
-            dataset=dataset,
-            sample_indices=list(sample_indices),
-            model=model,
-            target_value=target_value,
-            k=k,
-        )
-        counts = _summarize_results(results)
-        row["candidate_counts"] = counts
-        row["total_candidates"] = int(sum(counts.values()))
-
-        combo_objectives_kwargs = None
-        if objectives_kwargs_factory is not None:
-            combo_objectives_kwargs = _call_factory_compat(
-                objectives_kwargs_factory,
-                text_cfg,
-                image_cfg,
-            )
-        if combo_objectives_kwargs is None:
-            combo_objectives_kwargs = objectives_kwargs
-
-        if combo_objectives_kwargs is not None and results:
-            try:
-                row["objectives"] = _evaluate_combo_objectives(
-                    results, dataset, dict(combo_objectives_kwargs)
+            if extra_generators_factory is not None:
+                extras = _call_factory_compat(
+                    extra_generators_factory,
+                    tab_cfg,
+                    ts_cfg,
+                    text_cfg,
+                    text_backend_kwargs,
+                    image_cfg,
+                    image_backend_kwargs,
                 )
-            except Exception as exc_obj:
-                row["objectives_error"] = f"{type(exc_obj).__name__}: {exc_obj}"
+                if extras:
+                    generators.update(extras)
+            lib = CounterfactualLibrary(generators=generators)
+            results = lib.generate_batch(
+                dataset=dataset,
+                sample_indices=list(sample_indices),
+                model=model,
+                target_value=target_value,
+                k=k,
+            )
+
+            counts = _summarize_results(results)
+            row["candidate_counts"] = counts
+            row["total_candidates"] = int(sum(counts.values()))
+
+            combo_objectives_kwargs = None
+            if objectives_kwargs_factory is not None:
+                combo_objectives_kwargs = _call_factory_compat(
+                    objectives_kwargs_factory,
+                    text_cfg,
+                    image_cfg,
+                )
+            if combo_objectives_kwargs is None:
+                combo_objectives_kwargs = objectives_kwargs
+
+            if combo_objectives_kwargs is not None and results:
+                try:
+                    row["objectives"] = _evaluate_combo_objectives(
+                        results, dataset, dict(combo_objectives_kwargs)
+                    )
+                except Exception as exc_obj:
+                    row["objectives_error"] = f"{type(exc_obj).__name__}: {exc_obj}"
     except Exception as exc:  # noqa: BLE001
         row["status"] = "error"
         row["error"] = f"{type(exc).__name__}: {exc}"
@@ -664,6 +684,7 @@ def run_distance_ablation(
     rows = []
     started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     n_jobs = max(1, int(n_jobs))
+    worker_threads_limit = 1 if n_jobs > 1 else None
 
     run_root = None
     jsonl_path = None
@@ -721,6 +742,7 @@ def run_distance_ablation(
             objectives_kwargs=objectives_kwargs,
             objectives_kwargs_factory=objectives_kwargs_factory,
             extra_generators_factory=extra_generators_factory,
+            worker_threads_limit=worker_threads_limit,
         )
 
     combo_enumerator = enumerate(combo_iter, start=1)
@@ -745,6 +767,7 @@ def run_distance_ablation(
                 objectives_kwargs=objectives_kwargs,
                 objectives_kwargs_factory=objectives_kwargs_factory,
                 extra_generators_factory=extra_generators_factory,
+                worker_threads_limit=worker_threads_limit,
             )
             _persist_combo_output(row, results)
     else:

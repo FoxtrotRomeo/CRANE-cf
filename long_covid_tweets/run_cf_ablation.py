@@ -149,7 +149,8 @@ tab_metrics         = ["euclidean", "manhattan"]
 # ---------------------------------------------------------------------------
 # Build embed_fn for each text encoder (used for objective evaluation)
 # ---------------------------------------------------------------------------
-train_texts = list(dataset.X_train_text)
+train_texts = ["" if t is None else str(t) for t in dataset.X_train_text]
+test_texts = ["" if t is None else str(t) for t in dataset.X_test_text]
 
 # — tfidf (always available) —
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -323,13 +324,14 @@ if _pt_path.exists():
                         _model=_torch_model, _tok=_latent_tokenizer, _dev=_device_latent):
             import torch as _t
             text = str(text_candidate) if text_candidate is not None else ""
-            enc = _tok([text], max_length=128, padding="max_length",
-                       truncation=True, return_tensors="pt")
-            tab = _t.tensor(np.asarray(x_tab, dtype=np.float32)[None, :],
-                            dtype=_t.float32).to(_dev)
-            with _t.no_grad():
-                logits = _model(enc["input_ids"].to(_dev),
-                                enc["attention_mask"].to(_dev), tab)
+            with _HF_BACKEND_LOCK:
+                enc = _tok([text], max_length=128, padding="max_length",
+                           truncation=True, return_tensors="pt")
+                tab = _t.tensor(np.asarray(x_tab, dtype=np.float32)[None, :],
+                                dtype=_t.float32).to(_dev)
+                with _t.no_grad():
+                    logits = _model(enc["input_ids"].to(_dev),
+                                    enc["attention_mask"].to(_dev), tab)
             return float(logits.argmax(dim=-1).cpu().item())
 
     except Exception as _e:
@@ -411,12 +413,47 @@ if args.word2vec_path is not None:
 # — bert (already loaded in text_bk when not --no-bert) —
 _bert_embed_fn: Optional[object] = None
 if not args.no_bert:
-    from counterfactual_evaluation_helpers import _make_embed_fn_from_e5_kwargs
+    from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK, _make_embed_fn_from_e5_kwargs
     _bert_embed_fn = _make_embed_fn_from_e5_kwargs(
         tokenizer = text_bk["bert_tokenizer"],
         model     = text_bk["bert_model"],
         device    = text_bk["bert_device"],
     )
+else:
+    from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
+
+
+def _precompute_text_embeddings_once(name: str, embed_fn) -> Dict[str, np.ndarray]:
+    """Embed the full train+test corpus once and split it back into two arrays."""
+    all_texts = train_texts + test_texts
+    print(f"Precomputing {name} embeddings for {len(all_texts)} texts …")
+    all_embs = np.asarray(embed_fn(all_texts), dtype=np.float32)
+    n_train = len(train_texts)
+    return {
+        "train": all_embs[:n_train].copy(),
+        "test": all_embs[n_train:].copy(),
+    }
+
+
+_precomputed_text_embeddings_by_encoder: Dict[str, Dict[str, np.ndarray]] = {
+    "tfidf": _precompute_text_embeddings_once("tfidf", _tfidf_embed_fn),
+}
+if _bert_embed_fn is not None:
+    _precomputed_text_embeddings_by_encoder["bert"] = _precompute_text_embeddings_once(
+        "bert",
+        _bert_embed_fn,
+    )
+if _italian_ft_embed_fn is not None:
+    _precomputed_text_embeddings_by_encoder["custom"] = _precompute_text_embeddings_once(
+        "custom",
+        _italian_ft_embed_fn,
+    )
+if _w2v_embed_fn is not None:
+    _precomputed_text_embeddings_by_encoder["word2vec"] = _precompute_text_embeddings_once(
+        "word2vec",
+        _w2v_embed_fn,
+    )
+text_bk["precomputed_text_embeddings_by_encoder"] = _precomputed_text_embeddings_by_encoder
 
 # ---------------------------------------------------------------------------
 # Helpers shared by objectives and multimodal generator factories
@@ -433,6 +470,18 @@ def _get_embed_fn_for_encoder(encoder: str):
     if encoder == "word2vec" and _w2v_embed_fn is not None:
         return _w2v_embed_fn
     return _tfidf_embed_fn  # tfidf or raw → tfidf fallback
+
+
+def _get_precomputed_embeddings_for_encoder(encoder: str) -> Optional[Dict[str, np.ndarray]]:
+    """Return cached train/test embeddings matched to the combo's text encoder."""
+    if encoder == "bert":
+        return _precomputed_text_embeddings_by_encoder.get("bert")
+    if encoder == "custom":
+        return _precomputed_text_embeddings_by_encoder.get("custom")
+    if encoder == "word2vec":
+        return _precomputed_text_embeddings_by_encoder.get("word2vec")
+    # tfidf and raw both use tfidf embeddings for EarlyFusion space construction.
+    return _precomputed_text_embeddings_by_encoder.get("tfidf")
 
 
 def _metric_to_static_dist_fn(metric: str):
@@ -491,6 +540,7 @@ def _multimodal_generators_factory(
     encoder       = (text_cfg or {}).get("encoder", "raw")
     tab_metric    = (tab_cfg  or {}).get("__primary__", "euclidean")
     embed_fn      = _get_embed_fn_for_encoder(encoder)
+    precomputed_text = _get_precomputed_embeddings_for_encoder(encoder)
     static_dist   = _metric_to_static_dist_fn(tab_metric)
 
     extras = {
@@ -510,6 +560,12 @@ def _multimodal_generators_factory(
             k=args.k,
             distance_metric=tab_metric,
             e5_embed_fn=embed_fn,
+            precomputed_train_text_embeddings=(
+                None if precomputed_text is None else precomputed_text["train"]
+            ),
+            precomputed_test_text_embeddings=(
+                None if precomputed_text is None else precomputed_text["test"]
+            ),
         ),
     }
 

@@ -5,6 +5,7 @@ import threading
 
 
 _EMBEDDING_CACHE_LOCK = threading.Lock()
+_HF_BACKEND_LOCK = threading.RLock()
 
 
 def _to_numpy(x):
@@ -80,54 +81,58 @@ def embed_e5(
         return np.empty((0, int(hidden)), dtype=np.float32)
 
     prefixed = [f"{prefix}{'' if t is None else str(t)}" for t in texts]
-    model.eval()
 
-    out_chunks = []
-    with torch.no_grad():
-        for i in range(0, len(prefixed), max(1, int(batch_size))):
-            batch = prefixed[i : i + max(1, int(batch_size))]
-            toks = tokenizer(
-                batch,
-                truncation=True,
-                padding=True,
-                max_length=int(max_length),
-                return_tensors="pt",
-            )
+    # HuggingFace tokenizers/models are not reliably thread-safe when shared
+    # across Python worker threads, so serialize access to the backend objects.
+    with _HF_BACKEND_LOCK:
+        model.eval()
 
-            # Guard against tokenizer/model vocabulary mismatch that can trigger
-            # CUDA gather index-out-of-bounds assertions inside embedding lookup.
-            try:
-                inp = toks.get("input_ids", None)
-                emb_layer = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-                n_emb = int(getattr(emb_layer, "num_embeddings", 0)) if emb_layer is not None else 0
-                if inp is not None and n_emb > 0 and inp.numel() > 0:
-                    max_id = int(inp.max().item())
-                    min_id = int(inp.min().item())
-                    if min_id < 0 or max_id >= n_emb:
-                        raise ValueError(
-                            f"E5 token id out of range for model embeddings: "
-                            f"min_id={min_id}, max_id={max_id}, num_embeddings={n_emb}. "
-                            "Check tokenizer/model checkpoint compatibility."
-                        )
-            except Exception:
-                # Re-raise to be handled by caller fallbacks (max-penalty objective),
-                # rather than crashing in a GPU kernel.
-                raise
+        out_chunks = []
+        with torch.no_grad():
+            for i in range(0, len(prefixed), max(1, int(batch_size))):
+                batch = prefixed[i : i + max(1, int(batch_size))]
+                toks = tokenizer(
+                    batch,
+                    truncation=True,
+                    padding=True,
+                    max_length=int(max_length),
+                    return_tensors="pt",
+                )
 
-            toks = {k: v.to(device) for k, v in toks.items()}
+                # Guard against tokenizer/model vocabulary mismatch that can trigger
+                # CUDA gather index-out-of-bounds assertions inside embedding lookup.
+                try:
+                    inp = toks.get("input_ids", None)
+                    emb_layer = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+                    n_emb = int(getattr(emb_layer, "num_embeddings", 0)) if emb_layer is not None else 0
+                    if inp is not None and n_emb > 0 and inp.numel() > 0:
+                        max_id = int(inp.max().item())
+                        min_id = int(inp.min().item())
+                        if min_id < 0 or max_id >= n_emb:
+                            raise ValueError(
+                                f"E5 token id out of range for model embeddings: "
+                                f"min_id={min_id}, max_id={max_id}, num_embeddings={n_emb}. "
+                                "Check tokenizer/model checkpoint compatibility."
+                            )
+                except Exception:
+                    # Re-raise to be handled by caller fallbacks (max-penalty objective),
+                    # rather than crashing in a GPU kernel.
+                    raise
 
-            outputs = model(**toks)
-            hidden = outputs.last_hidden_state  # (B, L, D)
-            mask = toks["attention_mask"].unsqueeze(-1).to(hidden.dtype)  # (B, L, 1)
+                toks = {k: v.to(device) for k, v in toks.items()}
 
-            # Mean pooling with mask.
-            summed = (hidden * mask).sum(dim=1)  # (B, D)
-            denom = mask.sum(dim=1).clamp_min(1e-8)  # (B, 1)
-            emb = summed / denom
+                outputs = model(**toks)
+                hidden = outputs.last_hidden_state  # (B, L, D)
+                mask = toks["attention_mask"].unsqueeze(-1).to(hidden.dtype)  # (B, L, 1)
 
-            # L2 normalize.
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-            out_chunks.append(emb.detach().cpu().numpy().astype(np.float32))
+                # Mean pooling with mask.
+                summed = (hidden * mask).sum(dim=1)  # (B, D)
+                denom = mask.sum(dim=1).clamp_min(1e-8)  # (B, 1)
+                emb = summed / denom
+
+                # L2 normalize.
+                emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                out_chunks.append(emb.detach().cpu().numpy().astype(np.float32))
 
     return np.concatenate(out_chunks, axis=0)
 

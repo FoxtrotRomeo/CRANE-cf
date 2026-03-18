@@ -37,6 +37,9 @@ class EarlyFusionNN(CounterfactualGenerator):
     e5_embed_fn    : optional callable(texts) -> np.ndarray; overrides
                      tokenizer/model. When neither is provided the text
                      modality is skipped even if present.
+    precomputed_train_text_embeddings / precomputed_test_text_embeddings
+                   : optional 2-D arrays reused instead of re-embedding the
+                     full train/test text splits
     img_embed_fn   : optional callable(images) -> np.ndarray (n, D); when
                      provided it takes precedence over ``image_encoder``.
     image_encoder  : backbone for image encoding — ``"precomputed"`` (default),
@@ -57,6 +60,8 @@ class EarlyFusionNN(CounterfactualGenerator):
         e5_model=None,
         e5_device=None,
         e5_embed_fn: Optional[Callable] = None,
+        precomputed_train_text_embeddings=None,
+        precomputed_test_text_embeddings=None,
         img_embed_fn: Optional[Callable] = None,
         image_encoder: str = "precomputed",
         img_device: Optional[str] = None,
@@ -69,6 +74,8 @@ class EarlyFusionNN(CounterfactualGenerator):
         self.e5_model = e5_model
         self.e5_device = e5_device
         self.e5_embed_fn = e5_embed_fn
+        self.precomputed_train_text_embeddings = precomputed_train_text_embeddings
+        self.precomputed_test_text_embeddings = precomputed_test_text_embeddings
         self.img_embed_fn = img_embed_fn
         self.image_encoder = image_encoder
         self.img_device = img_device
@@ -105,6 +112,9 @@ class EarlyFusionNN(CounterfactualGenerator):
 
     def _has_text_support(self) -> bool:
         return (
+            self.precomputed_train_text_embeddings is not None
+            and self.precomputed_test_text_embeddings is not None
+        ) or (
             self.e5_embed_fn is not None
             or (self.e5_tokenizer is not None and self.e5_model is not None)
         )
@@ -236,8 +246,16 @@ class EarlyFusionNN(CounterfactualGenerator):
 
         # --- text embeddings (optional) ---
         use_text = "text" in dataset.available_modalities and self._has_text_support()
-        text_emb_train = self._embed_text(dataset.X_train_text) if use_text else None
-        text_emb_test = self._embed_text(dataset.X_test_text) if use_text else None
+        if use_text and self.precomputed_train_text_embeddings is not None and self.precomputed_test_text_embeddings is not None:
+            text_emb_train = np.asarray(self.precomputed_train_text_embeddings, dtype=float)
+            text_emb_test = np.asarray(self.precomputed_test_text_embeddings, dtype=float)
+            if text_emb_train.shape[0] != len(dataset.X_train_text):
+                raise ValueError("precomputed_train_text_embeddings rows must match X_train_text.")
+            if text_emb_test.shape[0] != len(dataset.X_test_text):
+                raise ValueError("precomputed_test_text_embeddings rows must match X_test_text.")
+        else:
+            text_emb_train = self._embed_text(dataset.X_train_text) if use_text else None
+            text_emb_test = self._embed_text(dataset.X_test_text) if use_text else None
 
         # --- image embeddings (optional) ---
         use_img = self._has_image_support(dataset)
