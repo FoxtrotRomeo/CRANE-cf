@@ -28,6 +28,7 @@ Template factory in this repo:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib
 import inspect
 import itertools
@@ -97,6 +98,21 @@ def _filter_kwargs_for_callable(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     sig = inspect.signature(fn)
     valid = set(sig.parameters.keys())
     return {k: v for k, v in kwargs.items() if k in valid}
+
+
+def _call_factory_compat(fn, *args):
+    """Call a user-provided factory while tolerating legacy shorter signatures."""
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return fn(*args)
+
+    positional_params = [
+        p for p in params
+        if p.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+    ]
+    return fn(*args[: len(positional_params)])
 
 
 def _infer_n_test(dataset) -> int:
@@ -401,6 +417,107 @@ def _summarize_results(results_by_sample: Dict[int, Dict[str, Any]]) -> Dict[str
     return counts
 
 
+def _run_ablation_combo(
+    *,
+    combo_id: str,
+    dataset,
+    model,
+    sample_indices: Sequence[int],
+    target_value: int,
+    k: int,
+    tab_cfg: Dict[str, str],
+    ts_cfg: Dict[str, Dict[str, Any]],
+    text_cfg: Optional[Dict[str, Any]],
+    text_backend_kwargs: Dict[str, Any],
+    image_cfg: Optional[Dict[str, Any]],
+    image_backend_kwargs: Dict[str, Any],
+    objectives_kwargs: Optional[Dict[str, Any]],
+    objectives_kwargs_factory: Optional[Any],
+    extra_generators_factory: Optional[Any],
+) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
+    row = {
+        "combo_id": combo_id,
+        "tab_metrics": tab_cfg,
+        "ts_metrics": {
+            name: {
+                "metric": cfg["metric"],
+                "dtw_window": cfg.get("dtw_window"),
+            }
+            for name, cfg in ts_cfg.items()
+        },
+        "text_config": text_cfg,
+        "image_config": image_cfg,
+        "status": "ok",
+        "error": None,
+        "runtime_sec": None,
+        "candidate_counts": {},
+        "total_candidates": 0,
+        "n_samples": len(sample_indices),
+    }
+
+    t0 = time.time()
+    results = {}
+    try:
+        generators = _build_generators_for_combo(
+            k=k,
+            tab_metrics_by_name=tab_cfg,
+            ts_metrics_by_name=ts_cfg,
+            text_cfg=text_cfg,
+            text_backend_kwargs=text_backend_kwargs,
+            image_cfg=image_cfg,
+            image_backend_kwargs=image_backend_kwargs,
+        )
+        if extra_generators_factory is not None:
+            extras = _call_factory_compat(
+                extra_generators_factory,
+                tab_cfg,
+                ts_cfg,
+                text_cfg,
+                text_backend_kwargs,
+                image_cfg,
+                image_backend_kwargs,
+            )
+            if extras:
+                generators.update(extras)
+        lib = CounterfactualLibrary(generators=generators)
+        results = lib.generate_batch(
+            dataset=dataset,
+            sample_indices=list(sample_indices),
+            model=model,
+            target_value=target_value,
+            k=k,
+        )
+        counts = _summarize_results(results)
+        row["candidate_counts"] = counts
+        row["total_candidates"] = int(sum(counts.values()))
+
+        combo_objectives_kwargs = None
+        if objectives_kwargs_factory is not None:
+            combo_objectives_kwargs = _call_factory_compat(
+                objectives_kwargs_factory,
+                text_cfg,
+                image_cfg,
+            )
+        if combo_objectives_kwargs is None:
+            combo_objectives_kwargs = objectives_kwargs
+
+        if combo_objectives_kwargs is not None and results:
+            try:
+                row["objectives"] = _evaluate_combo_objectives(
+                    results, dataset, dict(combo_objectives_kwargs)
+                )
+            except Exception as exc_obj:
+                row["objectives_error"] = f"{type(exc_obj).__name__}: {exc_obj}"
+    except Exception as exc:  # noqa: BLE001
+        row["status"] = "error"
+        row["error"] = f"{type(exc).__name__}: {exc}"
+        row["traceback"] = traceback.format_exc()
+    finally:
+        row["runtime_sec"] = float(time.time() - t0)
+
+    return row, results
+
+
 def run_distance_ablation(
     dataset,
     model,
@@ -423,6 +540,7 @@ def run_distance_ablation(
     run_name: Optional[str] = None,
     save_full: bool = False,
     max_combinations: Optional[int] = None,
+    n_jobs: int = 1,
     objectives_kwargs: Optional[Dict[str, Any]] = None,
     objectives_kwargs_factory: Optional[Any] = None,
     extra_generators_factory: Optional[Any] = None,
@@ -476,6 +594,9 @@ def run_distance_ablation(
         Called once per combo. The returned dict of ``{name: generator}``
         is merged into the combo's generator set alongside the standard
         unimodal generators. Return ``None`` or ``{}`` to add nothing.
+    n_jobs
+        Number of ablation combos to run concurrently. Values above 1 use a
+        thread pool that shares the same dataset, model, and backend objects.
     """
     tab_metrics = list(tab_metrics or ["euclidean", "manhattan", "hamming"])
     ts_metrics = list(ts_metrics or ["dtw", "euclidean", "lcss"])
@@ -542,6 +663,7 @@ def run_distance_ablation(
 
     rows = []
     started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    n_jobs = max(1, int(n_jobs))
 
     run_root = None
     jsonl_path = None
@@ -552,93 +674,114 @@ def run_distance_ablation(
         run_root.mkdir(parents=True, exist_ok=True)
         jsonl_path = run_root / "summary.jsonl"
 
-    for combo_idx, (tab_cfg, ts_cfg, text_cfg, image_cfg) in enumerate(combo_iter, start=1):
+    def _persist_combo_output(row: Dict[str, Any], results: Dict[int, Dict[str, Any]]) -> None:
+        rows.append(row)
+
+        if run_root is None:
+            return
+
+        combo_id = str(row["combo_id"])
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=_json_default) + "\n")
+
+        if save_full and row["status"] == "ok":
+            with open(run_root / f"{combo_id}_results.pkl", "wb") as f:
+                pickle.dump(results, f)
+        elif row["status"] == "error":
+            with open(run_root / f"{combo_id}_error.txt", "w", encoding="utf-8") as f:
+                f.write(str(row.get("traceback", row.get("error"))))
+
+    def _submit_combo(
+        executor: concurrent.futures.Executor,
+        combo_idx: int,
+        combo_args: Tuple[
+            Dict[str, str],
+            Dict[str, Dict[str, Any]],
+            Optional[Dict[str, Any]],
+            Optional[Dict[str, Any]],
+        ],
+    ) -> concurrent.futures.Future:
         combo_id = f"combo_{combo_idx:05d}"
         print(f"[ablation] Running {combo_id} ...")
+        tab_cfg, ts_cfg, text_cfg, image_cfg = combo_args
+        return executor.submit(
+            _run_ablation_combo,
+            combo_id=combo_id,
+            dataset=dataset,
+            model=model,
+            sample_indices=sample_indices,
+            target_value=target_value,
+            k=k,
+            tab_cfg=tab_cfg,
+            ts_cfg=ts_cfg,
+            text_cfg=text_cfg,
+            text_backend_kwargs=text_backend_kwargs,
+            image_cfg=image_cfg,
+            image_backend_kwargs=image_backend_kwargs,
+            objectives_kwargs=objectives_kwargs,
+            objectives_kwargs_factory=objectives_kwargs_factory,
+            extra_generators_factory=extra_generators_factory,
+        )
 
-        row = {
-            "combo_id": combo_id,
-            "tab_metrics": tab_cfg,
-            "ts_metrics": {
-                name: {
-                    "metric": cfg["metric"],
-                    "dtw_window": cfg.get("dtw_window"),
-                }
-                for name, cfg in ts_cfg.items()
-            },
-            "text_config": text_cfg,
-            "image_config": image_cfg,
-            "status": "ok",
-            "error": None,
-            "runtime_sec": None,
-            "candidate_counts": {},
-            "total_candidates": 0,
-            "n_samples": len(sample_indices),
-        }
-
-        t0 = time.time()
-        results = {}
-        try:
-            generators = _build_generators_for_combo(
+    combo_enumerator = enumerate(combo_iter, start=1)
+    if n_jobs == 1:
+        for combo_idx, combo_args in combo_enumerator:
+            combo_id = f"combo_{combo_idx:05d}"
+            print(f"[ablation] Running {combo_id} ...")
+            tab_cfg, ts_cfg, text_cfg, image_cfg = combo_args
+            row, results = _run_ablation_combo(
+                combo_id=combo_id,
+                dataset=dataset,
+                model=model,
+                sample_indices=sample_indices,
+                target_value=target_value,
                 k=k,
-                tab_metrics_by_name=tab_cfg,
-                ts_metrics_by_name=ts_cfg,
+                tab_cfg=tab_cfg,
+                ts_cfg=ts_cfg,
                 text_cfg=text_cfg,
                 text_backend_kwargs=text_backend_kwargs,
                 image_cfg=image_cfg,
                 image_backend_kwargs=image_backend_kwargs,
+                objectives_kwargs=objectives_kwargs,
+                objectives_kwargs_factory=objectives_kwargs_factory,
+                extra_generators_factory=extra_generators_factory,
             )
-            if extra_generators_factory is not None:
-                extras = extra_generators_factory(
-                    tab_cfg, ts_cfg, text_cfg, text_backend_kwargs, image_cfg, image_backend_kwargs
-                )
-                if extras:
-                    generators.update(extras)
-            lib = CounterfactualLibrary(generators=generators)
-            results = lib.generate_batch(
-                dataset=dataset,
-                sample_indices=list(sample_indices),
-                model=model,
-                target_value=target_value,
-                k=k,
-            )
-            counts = _summarize_results(results)
-            row["candidate_counts"] = counts
-            row["total_candidates"] = int(sum(counts.values()))
+            _persist_combo_output(row, results)
+    else:
+        print(f"[ablation] Running up to {n_jobs} combos in parallel.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            in_flight: Dict[concurrent.futures.Future, str] = {}
 
-            # Resolve per-combo objectives kwargs: factory takes priority
-            _combo_obj_kwargs = None
-            if objectives_kwargs_factory is not None:
-                _combo_obj_kwargs = objectives_kwargs_factory(text_cfg, image_cfg)
-            if _combo_obj_kwargs is None:
-                _combo_obj_kwargs = objectives_kwargs
-
-            if _combo_obj_kwargs is not None and results:
+            for _ in range(n_jobs):
                 try:
-                    row["objectives"] = _evaluate_combo_objectives(
-                        results, dataset, dict(_combo_obj_kwargs)
+                    combo_idx, combo_args = next(combo_enumerator)
+                except StopIteration:
+                    break
+                future = _submit_combo(executor, combo_idx, combo_args)
+                in_flight[future] = f"combo_{combo_idx:05d}"
+
+            while in_flight:
+                done, _ = concurrent.futures.wait(
+                    in_flight,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    combo_id = in_flight.pop(future)
+                    row, results = future.result()
+                    print(
+                        f"[ablation] Finished {combo_id} "
+                        f"({row['status']}, {row['runtime_sec']:.2f}s)."
                     )
-                except Exception as exc_obj:
-                    row["objectives_error"] = f"{type(exc_obj).__name__}: {exc_obj}"
-        except Exception as exc:  # noqa: BLE001
-            row["status"] = "error"
-            row["error"] = f"{type(exc).__name__}: {exc}"
-            row["traceback"] = traceback.format_exc()
-        finally:
-            row["runtime_sec"] = float(time.time() - t0)
+                    _persist_combo_output(row, results)
 
-        rows.append(row)
+                    try:
+                        combo_idx, combo_args = next(combo_enumerator)
+                    except StopIteration:
+                        continue
+                    new_future = _submit_combo(executor, combo_idx, combo_args)
+                    in_flight[new_future] = f"combo_{combo_idx:05d}"
 
-        if run_root is not None:
-            with open(jsonl_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, default=_json_default) + "\n")
-
-            if save_full and row["status"] == "ok":
-                with open(run_root / f"{combo_id}_results.pkl", "wb") as f:
-                    pickle.dump(results, f)
-            elif row["status"] == "error":
-                with open(run_root / f"{combo_id}_error.txt", "w", encoding="utf-8") as f:
-                    f.write(str(row.get("traceback", row.get("error"))))
+    rows.sort(key=lambda row: row["combo_id"])
 
     payload = {
         "started_at_utc": started_at,
@@ -690,6 +833,7 @@ def parse_args():
     p.add_argument("--target-value", type=int, default=0)
     p.add_argument("--k", type=int, default=20)
     p.add_argument("--max-combinations", type=int, default=None)
+    p.add_argument("--n-jobs", type=int, default=1, help="Number of ablation combos to run in parallel.")
 
     p.add_argument("--tab-metrics", type=str, default="euclidean,manhattan,hamming")
     p.add_argument("--ts-metrics", type=str, default="dtw,euclidean,lcss")
@@ -773,6 +917,7 @@ def main():
         run_name=args.run_name,
         save_full=bool(args.save_full),
         max_combinations=args.max_combinations,
+        n_jobs=args.n_jobs,
     )
 
 
