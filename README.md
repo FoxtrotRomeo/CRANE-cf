@@ -196,6 +196,15 @@ candidate: `outcome`, `proximity`, `sparsity`, and `plausibility`.
 each ablation row via `objectives_kwargs` or
 `objectives_kwargs_factory(text_cfg, image_cfg)`. Use `--n-jobs` to run
 multiple ablation combinations concurrently when your backend resources allow it.
+If parallel runs use BLAS-backed numeric kernels, prefer
+`OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1` to avoid nested
+thread explosions.
+
+Factories may also provide
+`text_backend_kwargs["precomputed_text_embeddings_by_encoder"] = {encoder: {"train": ..., "test": ...}}`.
+When present, `TextNN` and downstream multimodal generators reuse those
+precomputed matrices instead of re-embedding the full train/test text corpus
+for every sample or combo.
 
 ---
 
