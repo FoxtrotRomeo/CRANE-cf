@@ -4,7 +4,7 @@ You can point the ablation runner to functions in this file, e.g.:
 
     python run_distance_ablation.py \
       --factory ablation_factory_template:build_dataset_and_model \
-      --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "load_text": true}'
+      --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "load_text": true, "load_image": true, "image_encoder": "resnet50"}'
 
 or for a quick smoke test:
 
@@ -52,27 +52,47 @@ def build_dataset_and_model(
     ts_modalities: Optional[Sequence[str]] = None,
     tab_modalities: Optional[Sequence[str]] = None,
     load_text: bool = True,
+    load_image: bool = False,
+    image_encoder: str = "precomputed",
 ) -> Dict[str, Any]:
     """Load dataset/model from a folder layout.
 
     Required files in ``data_root``:
-      - ``X_train_static.npy``
-      - ``X_test_static.npy``
       - ``y_train.npy``
 
     Optional files:
-      - ``y_test.npy``
-      - text: ``X_train_text.npy``, ``X_test_text.npy`` (when ``load_text=True``)
+      - static:  ``X_train_static.npy``, ``X_test_static.npy``
+      - labels:  ``y_test.npy``
+      - text:    ``X_train_text.npy``, ``X_test_text.npy`` (when ``load_text=True``)
+      - image:   ``X_train_img.npy``, ``X_test_img.npy``  (when ``load_image=True``)
+                 Pre-computed embeddings (n, D) or raw pixel arrays.
       - TS modality ``m``: ``X_train_ts_{m}.npy``, ``X_test_ts_{m}.npy``
       - Tab modality ``m``: ``X_train_tab_{m}.npy``, ``X_test_tab_{m}.npy``
+
+    Parameters
+    ----------
+    image_encoder
+        Encoder to use when raw images are provided. Returned in
+        ``image_backend_kwargs`` so the ablation runner can forward it to
+        ``ImageNN``. One of ``"precomputed"`` (default), ``"resnet50"``,
+        ``"efficientnet_b0"``, ``"clip_vit_b32"``, or ``"custom"``.
     """
     root = Path(data_root)
     if not root.exists():
         raise FileNotFoundError(f"data_root does not exist: {root}")
 
-    X_train_static = np.asarray(_load_npy(root / "X_train_static.npy"), dtype=float)
-    X_test_static = np.asarray(_load_npy(root / "X_test_static.npy"), dtype=float)
     y_train = np.asarray(_load_npy(root / "y_train.npy")).reshape(-1)
+
+    # Static (optional)
+    X_train_static = None
+    X_test_static = None
+    static_tr = root / "X_train_static.npy"
+    static_te = root / "X_test_static.npy"
+    if static_tr.exists() and static_te.exists():
+        X_train_static = np.asarray(_load_npy(static_tr), dtype=float)
+        X_test_static = np.asarray(_load_npy(static_te), dtype=float)
+    else:
+        print("[factory] Static files not found, proceeding without static modality.")
 
     y_test_path = root / "y_test.npy"
     y_test = np.asarray(_load_npy(y_test_path)).reshape(-1) if y_test_path.exists() else None
@@ -110,9 +130,20 @@ def build_dataset_and_model(
         else:
             print("[factory] Text files not found, proceeding without text.")
 
+    X_train_img = None
+    X_test_img = None
+    if load_image:
+        tr_img = root / "X_train_img.npy"
+        te_img = root / "X_test_img.npy"
+        if tr_img.exists() and te_img.exists():
+            X_train_img = _load_npy(tr_img)
+            X_test_img = _load_npy(te_img)
+        else:
+            print("[factory] Image files not found, proceeding without image modality.")
+
     dataset = MultimodalDataset(
-        X_train_static=X_train_static,
         y_train=y_train,
+        X_train_static=X_train_static,
         X_test_static=X_test_static,
         X_train_ts=(X_train_ts or None),
         X_test_ts=(X_test_ts or None),
@@ -120,6 +151,8 @@ def build_dataset_and_model(
         X_test_tab=(X_test_tab or None),
         X_train_text=X_train_text,
         X_test_text=X_test_text,
+        X_train_img=X_train_img,
+        X_test_img=X_test_img,
         y_test=y_test,
     )
 
@@ -130,10 +163,16 @@ def build_dataset_and_model(
     # text_backend_kwargs = {"e5_tokenizer": tokenizer, "e5_model": e5_model, "e5_device": "cuda"}
     text_backend_kwargs: Dict[str, Any] = {}
 
+    # Add image backend objects here if you want to control encoding device / batch size.
+    # Example:
+    # image_backend_kwargs = {"image_encoder": "resnet50", "device": "cuda", "batch_size": 64}
+    image_backend_kwargs: Dict[str, Any] = {"image_encoder": image_encoder}
+
     return {
         "dataset": dataset,
         "model": model,
         "text_backend_kwargs": text_backend_kwargs,
+        "image_backend_kwargs": image_backend_kwargs,
     }
 
 
@@ -145,8 +184,16 @@ def build_synthetic_dataset_and_model(
     t: int = 12,
     d_static: int = 6,
     d_ts: int = 4,
+    d_img: int = 16,
 ) -> Dict[str, Any]:
-    """Return a tiny synthetic dataset for smoke-testing the ablation script."""
+    """Return a tiny synthetic dataset for smoke-testing the ablation script.
+
+    Parameters
+    ----------
+    d_img
+        Dimensionality of the synthetic pre-computed image embeddings.
+        Set to 0 to omit the image modality entirely.
+    """
     rng = np.random.default_rng(int(seed))
 
     X_train_static = rng.normal(size=(n_train, d_static))
@@ -173,14 +220,23 @@ def build_synthetic_dataset_and_model(
         dtype=object,
     )
 
+    # Synthetic pre-computed image embeddings (2-D → treated as precomputed by ImageNN).
+    X_train_img = None
+    X_test_img = None
+    if d_img > 0:
+        X_train_img = rng.normal(size=(n_train, d_img)).astype(np.float32)
+        X_test_img = rng.normal(size=(n_test, d_img)).astype(np.float32)
+
     dataset = MultimodalDataset(
-        X_train_static=X_train_static,
         y_train=y_train,
+        X_train_static=X_train_static,
         X_test_static=X_test_static,
         X_train_ts=X_train_ts,
         X_test_ts=X_test_ts,
         X_train_text=X_train_text,
         X_test_text=X_test_text,
+        X_train_img=X_train_img,
+        X_test_img=X_test_img,
         y_test=y_test,
     )
 
@@ -188,5 +244,5 @@ def build_synthetic_dataset_and_model(
         "dataset": dataset,
         "model": None,
         "text_backend_kwargs": {},
+        "image_backend_kwargs": {"image_encoder": "precomputed"},
     }
-
