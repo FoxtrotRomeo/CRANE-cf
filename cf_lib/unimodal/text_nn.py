@@ -120,7 +120,10 @@ class TextNN(CounterfactualGenerator):
         if n_avail == 0:
             return []
 
-        train_static = np.asarray(dataset.X_train_static, dtype=float)
+        train_static = (
+            np.asarray(dataset.X_train_static, dtype=float)
+            if dataset.X_train_static is not None else None
+        )
         train_ts = {
             name: np.asarray(arr, dtype=float)
             for name, arr in (dataset.X_train_ts or {}).items()
@@ -137,7 +140,10 @@ class TextNN(CounterfactualGenerator):
             subset = idxs[:use_n]
             anchor = int(idxs[i - 1])   # rank-matched: candidate i → neighbor i
 
-            static_med = np.asarray(np.median(train_static[subset], axis=0), dtype=float)
+            static_med = (
+                np.asarray(np.median(train_static[subset], axis=0), dtype=float)
+                if train_static is not None else None
+            )
             ts_meds = {
                 name: np.asarray(np.median(arr[subset], axis=0), dtype=float)
                 for name, arr in train_ts.items()
@@ -149,7 +155,7 @@ class TextNN(CounterfactualGenerator):
 
             results.append(
                 {
-                    "static": static_med,
+                    "static": static_med,   # None when no tabular modality
                     "ts": ts_meds,
                     "tab": tab_meds,
                     "text": str(train_text_np[anchor]),
@@ -198,8 +204,11 @@ class TextNN(CounterfactualGenerator):
 
         # find_k_closest_text expects meds/labs arrays for candidate construction;
         # TextNN materializes candidates itself, so placeholders are fine when absent.
-        n_train = int(np.asarray(dataset.X_train_static).shape[0])
-        n_test = int(np.asarray(dataset.X_test_static).shape[0])
+        # n_train / n_test are derived from y_train and the text arrays (static is optional).
+        n_train = len(dataset.y_train)
+        n_test = len(train_text_str)   # same length as test set after _to_str_list
+        # Re-derive n_test from the test text array (train_text_str is train).
+        n_test = len(test_text_str)
         ts_train_values = list((dataset.X_train_ts or {}).values())
         ts_test_values = list((dataset.X_test_ts or {}).values())
         train_meds = ts_train_values[0] if len(ts_train_values) > 0 else np.zeros((n_train, 1, 1), dtype=float)

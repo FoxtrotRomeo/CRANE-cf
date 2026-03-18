@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional
 
 from cf_lib.dataset import MultimodalDataset
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.unimodal import TabularNN, TimeSeriesNN, LabsNN, MedsNN, TextNN
+from cf_lib.unimodal import TabularNN, TimeSeriesNN, LabsNN, MedsNN, TextNN, ImageNN
 from cf_lib.multimodal import EarlyFusionNN, IntermediateFusionNN, FrankensteinNN, CombinedNN
 
 __all__ = [
@@ -57,6 +57,7 @@ __all__ = [
     "LabsNN",
     "MedsNN",
     "TextNN",
+    "ImageNN",
     "EarlyFusionNN",
     "IntermediateFusionNN",
     "FrankensteinNN",
@@ -122,6 +123,8 @@ class CounterfactualLibrary:
                 key = gen.tab_name if gen.tab_name is not None else "tabular"
             elif isinstance(gen, TextNN):
                 key = "text"
+            elif isinstance(gen, ImageNN):
+                key = "image"
             else:
                 continue  # compound or fusion generator — not a unimodal source
 
@@ -137,7 +140,7 @@ class CounterfactualLibrary:
                     if "train_text_str" not in pc:
                         pc["train_text_str"] = train_text_str
                 else:
-                    cands, idx, dist = raw
+                    cands, idx, dist = raw   # TabularNN, TimeSeriesNN, ImageNN
                     pc[key] = (idx, dist)
                 candidates_cache[id(gen)] = cands
             except Exception as exc:  # noqa: BLE001
@@ -174,7 +177,7 @@ class CounterfactualLibrary:
         Generators that raise an exception are skipped (entry is empty list).
         """
         _compound_types = (FrankensteinNN, CombinedNN)
-        _unimodal_types = (TabularNN, TimeSeriesNN, TextNN)
+        _unimodal_types = (TabularNN, TimeSeriesNN, TextNN, ImageNN)
         has_compound = any(isinstance(g, _compound_types) for g in self.generators.values())
         has_unimodal = any(isinstance(g, _unimodal_types) for g in self.generators.values())
 

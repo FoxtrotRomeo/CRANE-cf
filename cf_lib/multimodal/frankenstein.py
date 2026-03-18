@@ -11,19 +11,28 @@ import numpy as np
 from aeon.distances import dtw_distance
 from sklearn.metrics.pairwise import euclidean_distances
 
-from counterfactual_helpers import find_k_closest_static, find_k_closest_ts, find_k_closest_text
+from counterfactual_helpers import (
+    find_k_closest_static,
+    find_k_closest_ts,
+    find_k_closest_text,
+    find_k_closest_image,
+)
 from cf_lib.base import CounterfactualGenerator
 
 
 class FrankensteinNN(CounterfactualGenerator):
     """Hybrid counterfactuals from independent per-modality neighbor searches.
 
-    For each test sample, runs separate NN searches for static features, each
-    time-series modality in the dataset, and (optionally) text. Candidates are
-    assembled by taking the progressive median of each modality's own neighbors
-    independently — the i-th candidate is built from the i nearest neighbors
-    per modality, without requiring the same training sample to be close in all
-    spaces.
+    For each test sample, runs separate NN searches for each present modality
+    (static tabular, each time-series key, named-tabular blocks, text, image).
+    Candidates are assembled by taking the progressive median of each numeric
+    modality's own neighbors independently — the *i*-th candidate is built
+    from the *i* nearest neighbors per numeric modality, without requiring the
+    same training sample to be close in all spaces.  Text and image use
+    rank-matched selection (candidate *i* draws from the *i*-th neighbor).
+
+    All modalities are optional; only the modalities present in the dataset
+    are searched.
 
     Parameters
     ----------
@@ -31,6 +40,12 @@ class FrankensteinNN(CounterfactualGenerator):
     k_search        : pool size used in each per-modality unimodal search
     static_dist_fn  : distance for the static search (default: euclidean_distances)
     ts_dist_fn      : per-channel distance for time-series (default: dtw_distance)
+    img_embed_fn    : optional callable for image encoding; passed to
+                      ``find_k_closest_image`` as ``embed_fn``
+    image_encoder   : backbone string for image encoding (default: ``"precomputed"``)
+    img_distance_metric : distance metric for image search (default: ``"cosine"``)
+    img_device      : torch device string for image encoding
+    img_batch_size  : images per forward pass
     e5_tokenizer    : HuggingFace tokenizer for the E5 model (text search)
     e5_model        : HuggingFace E5 model
     e5_device       : torch device string, e.g. "cuda" or "cpu"
@@ -44,6 +59,11 @@ class FrankensteinNN(CounterfactualGenerator):
         k_search: int = 50,
         static_dist_fn: Callable = euclidean_distances,
         ts_dist_fn: Callable = dtw_distance,
+        img_embed_fn: Optional[Callable] = None,
+        image_encoder: str = "precomputed",
+        img_distance_metric: str = "cosine",
+        img_device: Optional[str] = None,
+        img_batch_size: int = 32,
         e5_tokenizer=None,
         e5_model=None,
         e5_device=None,
@@ -54,6 +74,11 @@ class FrankensteinNN(CounterfactualGenerator):
         self.k_search = k_search
         self.static_dist_fn = static_dist_fn
         self.ts_dist_fn = ts_dist_fn
+        self.img_embed_fn = img_embed_fn
+        self.image_encoder = image_encoder
+        self.img_distance_metric = img_distance_metric
+        self.img_device = img_device
+        self.img_batch_size = img_batch_size
         self.e5_tokenizer = e5_tokenizer
         self.e5_model = e5_model
         self.e5_device = e5_device
@@ -65,6 +90,7 @@ class FrankensteinNN(CounterfactualGenerator):
     def _frankenstein_partial(
         active_numeric: dict,
         active_text,
+        active_image,
         k: int,
         ts_names: Optional[set] = None,
         tab_names: Optional[set] = None,
@@ -74,10 +100,12 @@ class FrankensteinNN(CounterfactualGenerator):
         Parameters
         ----------
         active_numeric : dict role -> (idx_array_for_sample, train_array)
-            ``"static"`` is required; any number of time-series modality names
-            and named tabular modality names may also be included.
+            Any combination of ``"static"``, time-series modality names, and
+            named tabular modality names.
             ``idx_array_for_sample`` is a 1-D int array of sorted neighbor indices.
         active_text : tuple (idx_array_for_sample, train_text_str_list) or None
+        active_image : tuple (idx_array_for_sample, train_img) or None
+            ``train_img`` is the raw ``X_train_img`` (list or ndarray).
         k : number of candidates to build
         ts_names : set of keys in ``active_numeric`` that are time-series modalities
         tab_names : set of keys in ``active_numeric`` that are named tabular modalities
@@ -88,6 +116,8 @@ class FrankensteinNN(CounterfactualGenerator):
         n_per = {role: len(idxs) for role, (idxs, _) in active_numeric.items()}
         if active_text is not None:
             n_per["text"] = len(active_text[0])
+        if active_image is not None:
+            n_per["image"] = len(active_image[0])
         if not n_per:
             return []
         k_eff = min(k, *n_per.values())
@@ -120,6 +150,13 @@ class FrankensteinNN(CounterfactualGenerator):
                 text_input = train_text_np[anchor]
                 source_indices["text"] = anchor
 
+            img_val = None
+            if active_image is not None:
+                img_idxs, train_img = active_image
+                img_anchor = int(img_idxs[i - 1])
+                img_val = train_img[img_anchor]
+                source_indices["image"] = img_anchor
+
             ts_dict = {role: candidate[role] for role in candidate if role in ts_names}
             tab_dict = {role: candidate[role] for role in candidate if role in tab_names}
 
@@ -130,6 +167,8 @@ class FrankensteinNN(CounterfactualGenerator):
                     "tab": tab_dict,
                     "text": text_val,
                     "text_input": text_input,
+                    "image": img_val,
+                    "image_input": img_val,
                     "source_indices": source_indices,
                     "n_neighbors_used": use_n,
                 }
@@ -162,9 +201,10 @@ class FrankensteinNN(CounterfactualGenerator):
 
                 {
                     "tabular":   (indices_dict, distances_dict),
-                    <ts_name>:   (indices_dict, distances_dict),  # one per ts key
+                    <ts_name>:   (indices_dict, distances_dict),
                     "text":      (indices_dict, distances_dict),
                     "train_text_str": [...],
+                    "image":     (indices_dict, distances_dict),
                 }
 
             Missing keys are computed on-the-fly.
@@ -173,20 +213,22 @@ class FrankensteinNN(CounterfactualGenerator):
         pc = precomputed or {}
         avail = dataset.available_modalities
 
-        # --- static NN (always required) ---
-        if "tabular" in pc:
-            idx_static, _ = pc["tabular"]
-        else:
-            idx_static, _ = find_k_closest_static(
-                X_train_static=dataset.X_train_static,
-                y_train=dataset.y_train,
-                X_test_static=dataset.X_test_static,
-                selected_test_indices=[sample_idx],
-                target_value=target_value,
-                k=self.k_search,
-                distance_fn=self.static_dist_fn,
-                return_indices=True,
-            )
+        # --- static NN (only when tabular modality is present) ---
+        idx_static = None
+        if "tabular" in avail:
+            if "tabular" in pc:
+                idx_static, _ = pc["tabular"]
+            else:
+                idx_static, _ = find_k_closest_static(
+                    X_train_static=dataset.X_train_static,
+                    y_train=dataset.y_train,
+                    X_test_static=dataset.X_test_static,
+                    selected_test_indices=[sample_idx],
+                    target_value=target_value,
+                    k=self.k_search,
+                    distance_fn=self.static_dist_fn,
+                    return_indices=True,
+                )
 
         # --- per-ts NN (one search per key in X_train_ts) ---
         ts_indices: Dict[str, dict] = {}
@@ -208,7 +250,7 @@ class FrankensteinNN(CounterfactualGenerator):
                     )
                     ts_indices[ts_name] = idx_ts
 
-        # --- per-named-tabular NN (one search per key in X_train_tab) ---
+        # --- per-named-tabular NN ---
         tab_indices: Dict[str, dict] = {}
         tab_names_list = list((dataset.X_train_tab or {}).keys())
         for tab_name in tab_names_list:
@@ -237,7 +279,6 @@ class FrankensteinNN(CounterfactualGenerator):
             if "text" in pc:
                 idx_text, _ = pc["text"]
             else:
-                # Use the first two ts arrays (if available) for the text helper.
                 ts_list = list((dataset.X_train_ts or {}).values())
                 train_ts1 = ts_list[0] if len(ts_list) > 0 else None
                 train_ts2 = ts_list[1] if len(ts_list) > 1 else None
@@ -265,13 +306,33 @@ class FrankensteinNN(CounterfactualGenerator):
                     test_text_raw=dataset.X_test_text,
                 )
 
-        # --- build active_numeric and active_text, then assemble candidates ---
-        active_numeric = {
-            "static": (
+        # --- image NN (skipped when not in dataset) ---
+        idx_image = None
+        if "image" in avail:
+            if "image" in pc:
+                idx_image, _ = pc["image"]
+            else:
+                idx_image, _ = find_k_closest_image(
+                    X_train_img=dataset.X_train_img,
+                    y_train=dataset.y_train,
+                    X_test_img=dataset.X_test_img,
+                    selected_test_indices=[sample_idx],
+                    target_value=target_value,
+                    k=self.k_search,
+                    image_encoder=self.image_encoder,
+                    image_distance_metric=self.img_distance_metric,
+                    embed_fn=self.img_embed_fn,
+                    device=self.img_device,
+                    batch_size=self.img_batch_size,
+                )
+
+        # --- build active_numeric, active_text, active_image ---
+        active_numeric: dict = {}
+        if idx_static is not None:
+            active_numeric["static"] = (
                 np.asarray(idx_static.get(int(sample_idx), []), dtype=int),
                 dataset.X_train_static,
             )
-        }
         for ts_name, idx_ts in ts_indices.items():
             active_numeric[ts_name] = (
                 np.asarray(idx_ts.get(int(sample_idx), []), dtype=int),
@@ -290,9 +351,21 @@ class FrankensteinNN(CounterfactualGenerator):
                 train_text_str,
             )
 
+        active_image = None
+        if idx_image is not None:
+            active_image = (
+                np.asarray(idx_image.get(int(sample_idx), []), dtype=int),
+                dataset.X_train_img,
+            )
+
+        if not active_numeric and active_text is None and active_image is None:
+            print("[FrankensteinNN] no modalities available for this dataset — returning empty candidates.")
+            return []
+
         return self._frankenstein_partial(
             active_numeric,
             active_text,
+            active_image,
             k,
             ts_names=set(ts_names),
             tab_names=set(tab_indices.keys()),

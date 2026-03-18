@@ -10,12 +10,6 @@ from collections import Counter
 import os
 os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0 --tf_xla_enable_xla_devices=false")
 import tensorflow as tf
-from counterfactual_edits_helpers import (
-    decode_ts_edits,
-    apply_decoded_edits,
-    EDIT_SLOT_DIM,
-    TEXT_EDIT_SLOT_DIM,
-)
 
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"]="expandable_segments:True"
@@ -848,6 +842,310 @@ def _embed_word2vec_average(texts, *, word2vec_model):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+
+def _is_image_precomputed(img_data) -> bool:
+    """Return True when img_data looks like pre-computed 2-D embeddings.
+
+    Heuristic:
+    - numpy ndarray with ndim == 2 → pre-computed
+    - list / tuple whose first element is a float array of shape (D,) → pre-computed
+    - anything else (PIL list, 3-D / 4-D array) → raw images
+    """
+    if isinstance(img_data, np.ndarray):
+        return img_data.ndim == 2
+    if isinstance(img_data, (list, tuple)) and len(img_data) > 0:
+        first = img_data[0]
+        if isinstance(first, np.ndarray) and first.ndim == 1:
+            return True
+    return False
+
+
+def _to_pil_list(img_data):
+    """Convert various raw-image formats to a list of PIL Images."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ImportError(
+            "Pillow is required for raw-image encoding. Install with: pip install Pillow"
+        ) from exc
+
+    if isinstance(img_data, (list, tuple)):
+        if len(img_data) == 0:
+            return []
+        first = img_data[0]
+        # Already PIL Images
+        if hasattr(first, "convert"):
+            return list(img_data)
+        # List of (H, W, C) or (H, W) ndarrays
+        return [Image.fromarray(np.asarray(img).astype(np.uint8)) for img in img_data]
+
+    arr = np.asarray(img_data)
+    if arr.ndim == 3:
+        # Single image (H, W, C)
+        return [Image.fromarray(arr.astype(np.uint8))]
+    if arr.ndim == 4:
+        # Batch (N, H, W, C)
+        return [Image.fromarray(arr[i].astype(np.uint8)) for i in range(arr.shape[0])]
+    raise ValueError(
+        f"Cannot convert image data of shape {arr.shape} to PIL Images. "
+        "Expected (N, H, W, C) ndarray, list of PIL Images, or list of (H, W, C) arrays."
+    )
+
+
+def _build_vision_encoder(backbone: str, device=None):
+    """Return a callable ``encode_fn(pil_images) -> np.ndarray (n, D)``."""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_obj = torch.device(device)
+
+    if backbone == "clip_vit_b32":
+        try:
+            import clip  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "openai-clip is required for CLIP encoding. "
+                "Install with: pip install git+https://github.com/openai/CLIP.git"
+            ) from exc
+        model, preprocess = clip.load("ViT-B/32", device=device_obj)
+        model.eval()
+
+        def encode_fn(pil_images):
+            imgs = torch.stack([preprocess(img) for img in pil_images]).to(device_obj)
+            with torch.no_grad():
+                feats = model.encode_image(imgs)
+            return feats.cpu().float().numpy()
+
+        return encode_fn
+
+    try:
+        import torchvision.models as tvm  # noqa: PLC0415
+        import torchvision.transforms as T  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "torchvision is required for ResNet/EfficientNet encoding. "
+            "Install with: pip install torchvision"
+        ) from exc
+
+    preprocess = T.Compose([
+        T.Resize(256),
+        T.CenterCrop(224),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    if backbone == "resnet50":
+        model = tvm.resnet50(weights="IMAGENET1K_V2")
+        model.fc = torch.nn.Identity()
+    elif backbone == "efficientnet_b0":
+        model = tvm.efficientnet_b0(weights="IMAGENET1K_V1")
+        model.classifier = torch.nn.Identity()
+    else:
+        raise ValueError(
+            f"Unknown backbone '{backbone}'. "
+            "Supported: 'resnet50', 'efficientnet_b0', 'clip_vit_b32'."
+        )
+
+    model = model.to(device_obj).eval()
+
+    def encode_fn(pil_images):
+        imgs = torch.stack([preprocess(img) for img in pil_images]).to(device_obj)
+        with torch.no_grad():
+            feats = model(imgs)
+        return feats.cpu().float().numpy()
+
+    return encode_fn
+
+
+def _apply_vision_encoder(img_data, encode_fn, batch_size: int = 32) -> np.ndarray:
+    """Encode img_data in batches; return (n, D) float array."""
+    imgs = _to_pil_list(img_data)
+    n = len(imgs)
+    if n == 0:
+        return np.empty((0, 0), dtype=float)
+    vecs = []
+    for i in range(0, n, batch_size):
+        vecs.append(encode_fn(imgs[i : i + batch_size]))
+    return np.concatenate(vecs, axis=0).astype(float)
+
+
+def _build_image_representations(
+    X_train_img,
+    X_test_img,
+    *,
+    image_encoder="precomputed",
+    embed_fn=None,
+    device=None,
+    batch_size=32,
+):
+    """Return (emb_train, emb_test) as (n, D) float ndarrays.
+
+    Parameters
+    ----------
+    image_encoder : ``"precomputed"`` | ``"resnet50"`` | ``"efficientnet_b0"``
+                    | ``"clip_vit_b32"`` | ``"custom"``
+    embed_fn      : optional callable ``(images) -> np.ndarray (n, D)``.
+                    When provided it takes precedence over ``image_encoder``.
+    device        : torch device string (e.g. ``"cuda"`` or ``"cpu"``).
+                    Defaults to CUDA when available, else CPU.
+    batch_size    : number of images processed per forward pass.
+    """
+    # Custom callable always takes priority.
+    if embed_fn is not None:
+        emb_train = np.asarray(embed_fn(X_train_img), dtype=float)
+        emb_test = np.asarray(embed_fn(X_test_img), dtype=float)
+        return emb_train, emb_test
+
+    enc = "precomputed" if image_encoder is None else str(image_encoder).strip().lower()
+
+    # Auto-detect: if data looks like 2-D embeddings, treat as precomputed.
+    if enc == "precomputed" or _is_image_precomputed(X_train_img):
+        emb_train = np.asarray(X_train_img, dtype=float)
+        emb_test = np.asarray(X_test_img, dtype=float)
+        if emb_train.ndim != 2 or emb_test.ndim != 2:
+            raise ValueError(
+                "Pre-computed image embeddings must be 2-D arrays (n_samples, D). "
+                f"Got shapes: train={emb_train.shape}, test={emb_test.shape}. "
+                "If these are raw images set image_encoder to 'resnet50', "
+                "'efficientnet_b0', 'clip_vit_b32', or 'custom' with embed_fn."
+            )
+        return emb_train, emb_test
+
+    if enc in {"resnet50", "efficientnet_b0", "clip_vit_b32"}:
+        encoder_fn = _build_vision_encoder(enc, device=device)
+        emb_train = _apply_vision_encoder(X_train_img, encoder_fn, batch_size=batch_size)
+        emb_test = _apply_vision_encoder(X_test_img, encoder_fn, batch_size=batch_size)
+        return emb_train, emb_test
+
+    raise ValueError(
+        f"Unsupported image_encoder '{image_encoder}'. "
+        "Use one of {'precomputed', 'resnet50', 'efficientnet_b0', 'clip_vit_b32', 'custom'} "
+        "or provide embed_fn."
+    )
+
+
+def find_k_closest_image(
+    X_train_img,
+    y_train,
+    X_test_img,
+    selected_test_indices,
+    *,
+    target_value=0,
+    k=5,
+    image_encoder="precomputed",
+    image_distance_metric="cosine",
+    image_distance_fn=None,
+    embed_fn=None,
+    device=None,
+    batch_size=32,
+):
+    """Image-NN: find the k nearest opposite-class training images.
+
+    Supports pre-computed embeddings and on-the-fly encoding via a
+    torchvision/CLIP backbone or a user-supplied callable.
+
+    Parameters
+    ----------
+    X_train_img, X_test_img
+        Either pre-computed (n, D) float arrays **or** raw images (list of PIL
+        Images / (n, H, W, C) ndarray).  Auto-detected unless overridden by
+        ``image_encoder``.
+    y_train : (n_train,) int array
+    selected_test_indices : list[int]
+    target_value : desired counterfactual class label
+    k : number of neighbors
+    image_encoder : ``"precomputed"`` (default) | ``"resnet50"`` |
+                    ``"efficientnet_b0"`` | ``"clip_vit_b32"`` | ``"custom"``
+    image_distance_metric : ``"cosine"`` (default) | ``"euclidean"`` |
+                             ``"manhattan"`` | ``"hamming"`` | or any
+                             sklearn-compatible metric string
+    image_distance_fn : optional pairwise-distance callable
+    embed_fn : optional callable ``(images) -> np.ndarray (n, D)``;
+               takes precedence over ``image_encoder``
+    device : torch device string
+    batch_size : images per forward pass
+
+    Returns
+    -------
+    indices_dict  : dict[test_idx -> 1-D int array of length k_eff]
+    distances_dict : dict[test_idx -> 1-D float array of length k_eff]
+    """
+    k = _validate_k(k)
+    y_train = np.asarray(y_train).reshape(-1)
+    n_train = len(y_train)
+
+    # Infer n_test from the test image array.
+    if isinstance(X_test_img, (list, tuple)):
+        n_test = len(X_test_img)
+    else:
+        n_test = int(np.asarray(X_test_img).shape[0])
+
+    selected_test_indices = _normalize_selected_test_indices(selected_test_indices, n_test)
+
+    emb_train, emb_test = _build_image_representations(
+        X_train_img, X_test_img,
+        image_encoder=image_encoder,
+        embed_fn=embed_fn,
+        device=device,
+        batch_size=batch_size,
+    )
+
+    if emb_train.ndim != 2 or emb_test.ndim != 2:
+        raise ValueError("Image representations must be 2-D arrays (n, D).")
+    if emb_train.shape[1] != emb_test.shape[1]:
+        raise ValueError("Train/test image embedding dimensions do not match.")
+    if emb_train.shape[0] != n_train:
+        raise ValueError("Image embedding row count does not match y_train length.")
+    if emb_test.shape[0] != n_test:
+        raise ValueError("Test image embedding row count does not match X_test_img length.")
+
+    metric_norm = _normalize_distance_metric(image_distance_metric, default="cosine")
+    if metric_norm == "cosine":
+        norms = np.linalg.norm(emb_train, axis=1, keepdims=True)
+        emb_train = emb_train / np.where(norms < 1e-8, 1.0, norms)
+        norms = np.linalg.norm(emb_test, axis=1, keepdims=True)
+        emb_test = emb_test / np.where(norms < 1e-8, 1.0, norms)
+
+    candidate_indices = np.flatnonzero(y_train == target_value).astype(int)
+    n_cand = candidate_indices.shape[0]
+
+    indices_dict: dict = {}
+    distances_dict: dict = {}
+
+    if n_cand == 0:
+        empty_idx = np.empty((0,), dtype=int)
+        empty_dist = np.empty((0,), dtype=float)
+        for ti in selected_test_indices:
+            indices_dict[int(ti)] = empty_idx
+            distances_dict[int(ti)] = empty_dist
+        return indices_dict, distances_dict
+
+    selected_test_indices_arr = np.asarray(selected_test_indices, dtype=int)
+    dist_matrix = _pairwise_vector_distances(
+        emb_test[selected_test_indices_arr],
+        emb_train[candidate_indices],
+        distance_fn=image_distance_fn,
+        distance_metric=metric_norm,
+        default_metric="cosine",
+    )
+
+    k_eff = min(k, n_cand)
+    for r, test_idx in enumerate(selected_test_indices_arr):
+        dists = dist_matrix[r]
+        if k_eff == n_cand:
+            sel_local = np.argsort(dists)[:k_eff]
+        else:
+            kth = max(0, min(k_eff - 1, dists.shape[0] - 1))
+            idx_k = np.argpartition(dists, kth)[:k_eff]
+            sel_local = idx_k[np.argsort(dists[idx_k])]
+        indices_dict[int(test_idx)] = candidate_indices[sel_local].astype(int)
+        distances_dict[int(test_idx)] = dists[sel_local].astype(float)
+
+    return indices_dict, distances_dict
+
+
 def _build_text_representations(
     train_texts_str,
     test_texts_str,
@@ -983,6 +1281,9 @@ def find_k_closest_text(
     train_text_raw=None,
     test_text_raw=None,
 ):
+    # X_train_static and X_test_static are optional (may be None when the
+    # dataset has no tabular features). n_train / n_test are inferred from
+    # y_train and the text arrays respectively.
     """Text-NN counterfactuals with configurable encoders and distance metrics.
 
     Supported encoders:
@@ -998,16 +1299,27 @@ def find_k_closest_text(
     ``text_distance_fn`` when provided.
     """
     k = _validate_k(k)
-    selected_test_indices = _normalize_selected_test_indices(
-        selected_test_indices, np.asarray(X_test_static).shape[0]
-    )
-
-    X_train_static = np.asarray(X_train_static)
-    X_test_static = np.asarray(X_test_static)
     y_train = np.asarray(y_train).reshape(-1)
+    n_train = int(y_train.shape[0])
 
-    n_train = int(X_train_static.shape[0])
-    n_test = int(X_test_static.shape[0])
+    train_text_arr = np.asarray(train_text_for_distance, dtype=object).reshape(-1)
+    test_text_arr = np.asarray(test_text_for_distance, dtype=object).reshape(-1)
+    n_test = int(test_text_arr.shape[0])
+
+    selected_test_indices = _normalize_selected_test_indices(selected_test_indices, n_test)
+
+    if train_text_arr.shape[0] != n_train:
+        raise ValueError("train_text_for_distance length must match y_train length.")
+
+    # X_train_static / X_test_static may be None (no tabular modality).
+    if X_train_static is not None:
+        X_train_static = np.asarray(X_train_static)
+        if int(X_train_static.shape[0]) != n_train:
+            raise ValueError("X_train_static rows must match y_train length.")
+    if X_test_static is not None:
+        X_test_static = np.asarray(X_test_static)
+        if int(X_test_static.shape[0]) != n_test:
+            raise ValueError("X_test_static rows must match test text length.")
 
     if X_train_meds is None:
         X_train_meds = np.zeros((n_train, 1, 1), dtype=float)
@@ -1026,22 +1338,14 @@ def find_k_closest_text(
     if (
         n_train != int(X_train_meds.shape[0])
         or n_train != int(X_train_labs.shape[0])
-        or n_train != int(y_train.shape[0])
     ):
         raise ValueError(
-            "X_train_static, X_train_meds, X_train_labs, and y_train must have matching first dimension."
+            "X_train_meds, X_train_labs, and y_train must have matching first dimension."
         )
     if n_test != int(X_test_meds.shape[0]) or n_test != int(X_test_labs.shape[0]):
         raise ValueError(
-            "X_test_static, X_test_meds, and X_test_labs must have matching first dimension."
+            "X_test_meds and X_test_labs must have matching first dimension."
         )
-
-    train_text_arr = np.asarray(train_text_for_distance, dtype=object).reshape(-1)
-    test_text_arr = np.asarray(test_text_for_distance, dtype=object).reshape(-1)
-    if train_text_arr.shape[0] != X_train_static.shape[0]:
-        raise ValueError("train_text_for_distance length must match training rows.")
-    if test_text_arr.shape[0] != X_test_static.shape[0]:
-        raise ValueError("test_text_for_distance length must match test rows.")
 
     if train_text_raw is None:
         train_text_raw = train_text_arr
@@ -1121,6 +1425,14 @@ def find_k_closest_text(
         if emb_train.shape[0] != n_train or emb_test.shape[0] != n_test:
             raise ValueError("Text representation rows must match train/test sample counts.")
 
+        # L2-normalise only for cosine distance; euclidean/manhattan operate on
+        # the raw embedding magnitudes so normalisation would collapse the space.
+        if metric_norm == "cosine":
+            norms = np.linalg.norm(emb_train, axis=1, keepdims=True)
+            emb_train = emb_train / np.where(norms < 1e-8, 1.0, norms)
+            norms = np.linalg.norm(emb_test, axis=1, keepdims=True)
+            emb_test = emb_test / np.where(norms < 1e-8, 1.0, norms)
+
         dist_matrix = _pairwise_vector_distances(
             emb_test[selected_test_indices_arr],
             emb_train[candidate_indices],
@@ -1149,16 +1461,19 @@ def find_k_closest_text(
             subset_idx = ordered_train_idx[:use_n]
             anchor_idx = int(ordered_train_idx[use_n - 1])
 
-            tab_med = np.median(X_train_static[subset_idx], axis=0)
+            tab_med = (
+                np.asarray(np.median(X_train_static[subset_idx], axis=0), dtype=float)
+                if X_train_static is not None else None
+            )
             meds_med = np.median(X_train_meds[subset_idx], axis=0)
             labs_med = np.median(X_train_labs[subset_idx], axis=0)
 
             cfs.append(
                 {
-                    "static": np.asarray(tab_med, dtype=float),
+                    "static": tab_med,
                     "meds": np.asarray(meds_med, dtype=float),
                     "labs": np.asarray(labs_med, dtype=float),
-                    "tab": np.asarray(tab_med, dtype=float),
+                    "tab": tab_med,
                     "ts": {
                         "labs": np.asarray(labs_med, dtype=float),
                         "meds": np.asarray(meds_med, dtype=float),
@@ -1538,6 +1853,8 @@ def find_k_closest_latent_model(
     X_test_meds=None,
     X_test_labs=None,
     X_test_text=None,
+    X_train_img=None,
+    X_test_img=None,
     target_value=0,
     k=5,
     distance_fn=euclidean_distances,
@@ -1591,11 +1908,22 @@ def find_k_closest_latent_model(
         and X_test_labs is not None
         and X_test_text is not None
     )
+    use_five_input = (
+        int(n_inputs) == 5
+        and X_train_meds is not None
+        and X_train_labs is not None
+        and X_train_text is not None
+        and X_train_img is not None
+        and X_test_meds is not None
+        and X_test_labs is not None
+        and X_test_text is not None
+        and X_test_img is not None
+    )
 
     if X_train.shape[0] != y_train.shape[0]:
         raise ValueError("X_train and y_train must have matching first dimension.")
 
-    if use_four_input:
+    if use_four_input or use_five_input:
         X_train_meds = np.asarray(X_train_meds)
         X_train_labs = np.asarray(X_train_labs)
         X_train_text = np.asarray(X_train_text)
@@ -1605,27 +1933,46 @@ def find_k_closest_latent_model(
 
         n_train = X_train.shape[0]
         n_test = X_test.shape[0]
-        if (
+        train_checks = (
             X_train_meds.shape[0] != n_train
             or X_train_labs.shape[0] != n_train
             or X_train_text.shape[0] != n_train
-        ):
-            raise ValueError("All train modality arrays must have the same number of patients.")
-        if (
+        )
+        test_checks = (
             X_test_meds.shape[0] != n_test
             or X_test_labs.shape[0] != n_test
             or X_test_text.shape[0] != n_test
-        ):
+        )
+        if use_five_input:
+            X_train_img = np.asarray(X_train_img)
+            X_test_img = np.asarray(X_test_img)
+            train_checks = train_checks or X_train_img.shape[0] != n_train
+            test_checks = test_checks or X_test_img.shape[0] != n_test
+        if train_checks:
+            raise ValueError("All train modality arrays must have the same number of patients.")
+        if test_checks:
             raise ValueError("All test modality arrays must have the same number of patients.")
 
-    # Create a new model that excludes the last layer.
-    latent_model = keras.Model(inputs=model.input, outputs=model.layers[-2].output)
+    # Build the Keras latent model only when we actually need it to compute
+    # representations.  When both precomputed arrays are provided (e.g. from a
+    # PyTorch model) we skip this block entirely so no Keras dependency is needed.
+    _need_latent_model = (
+        precomputed_train_latent is None or precomputed_test_latent is None
+    )
+    latent_model = None
+    if _need_latent_model:
+        latent_model = keras.Model(inputs=model.input, outputs=model.layers[-2].output)
 
     # Generate latent representations for the train and test sets (or reuse precomputed).
     if precomputed_train_latent is not None:
         X_train_latent = np.asarray(precomputed_train_latent)
     else:
-        if use_four_input:
+        if use_five_input:
+            X_train_latent = latent_model.predict(
+                [X_train_meds, X_train_labs, X_train, X_train_text, X_train_img],
+                verbose=0,
+            )
+        elif use_four_input:
             X_train_latent = latent_model.predict(
                 [X_train_meds, X_train_labs, X_train, X_train_text],
                 verbose=0,
@@ -1636,7 +1983,12 @@ def find_k_closest_latent_model(
     if precomputed_test_latent is not None:
         X_test_latent = np.asarray(precomputed_test_latent)
     else:
-        if use_four_input:
+        if use_five_input:
+            X_test_latent = latent_model.predict(
+                [X_test_meds, X_test_labs, X_test, X_test_text, X_test_img],
+                verbose=0,
+            )
+        elif use_four_input:
             X_test_latent = latent_model.predict(
                 [X_test_meds, X_test_labs, X_test, X_test_text],
                 verbose=0,
@@ -1666,7 +2018,7 @@ def find_k_closest_latent_model(
     n_cand = candidate_samples.shape[0]
     print(f"Number of candidate samples with target value {target_value}: {n_cand}")
     if n_cand == 0:
-        empty_neighbors = [] if use_four_input else X_train[:0]
+        empty_neighbors = [] if (use_four_input or use_five_input) else X_train[:0]
         empty_dist = np.empty((0,), dtype=float)
         neighbors = {int(ti): empty_neighbors for ti in selected_test_indices}
         dists = {int(ti): empty_dist for ti in selected_test_indices}
@@ -1702,7 +2054,7 @@ def find_k_closest_latent_model(
             sel_local = idx_k[np.argsort(dists[idx_k])]
 
         selected_train_indices = candidate_indices[sel_local].astype(int)
-        if use_four_input:
+        if use_five_input or use_four_input:
             neighbors_input_dict[int(test_idx)] = [
                 {
                     "static": np.asarray(X_train[s_idx]),
@@ -1715,6 +2067,8 @@ def find_k_closest_latent_model(
                         "meds": np.asarray(X_train_meds[s_idx]),
                     },
                     "text_input": X_train_text[s_idx],
+                    **({"image": X_train_img[s_idx], "image_input": X_train_img[s_idx]}
+                       if use_five_input else {}),
                 }
                 for s_idx in selected_train_indices
             ]

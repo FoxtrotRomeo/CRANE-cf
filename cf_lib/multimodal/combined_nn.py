@@ -11,19 +11,27 @@ import numpy as np
 from aeon.distances import dtw_distance
 from sklearn.metrics.pairwise import euclidean_distances
 
-from counterfactual_helpers import find_k_closest_static, find_k_closest_ts, find_k_closest_text
+from counterfactual_helpers import (
+    find_k_closest_static,
+    find_k_closest_ts,
+    find_k_closest_text,
+    find_k_closest_image,
+)
 from cf_lib.base import CounterfactualGenerator
 
 
 class CombinedNN(CounterfactualGenerator):
     """Nearest-neighbour counterfactuals with joint inter-modality agreement.
 
-    Runs separate unimodal NN searches for static features, each time-series
-    modality, and (optionally) text. Then intersects the candidate sets across
-    all modalities, sums the per-modality distances for each common candidate,
-    and selects the k with the lowest summed distance.
+    Runs separate unimodal NN searches for each present modality (static
+    tabular, each time-series key, named-tabular blocks, text, image).
+    Intersects the candidate sets across all modalities, sums the
+    per-modality distances for each common candidate, and selects the *k*
+    with the lowest summed distance.
 
-    Final candidates are materialised as progressive-median synthetic samples.
+    All modalities are optional; only those present in the dataset are searched.
+    Final candidates are materialised as progressive-median synthetic samples
+    for numeric modalities; text and image use rank-matched selection.
 
     Parameters
     ----------
@@ -31,6 +39,11 @@ class CombinedNN(CounterfactualGenerator):
     k_search        : pool size used in each unimodal search before intersection
     static_dist_fn  : distance for the static search (default: euclidean_distances)
     ts_dist_fn      : per-channel distance for time-series (default: dtw_distance)
+    img_embed_fn    : optional callable for image encoding
+    image_encoder   : backbone string for image encoding (default: ``"precomputed"``)
+    img_distance_metric : distance metric for image search (default: ``"cosine"``)
+    img_device      : torch device string for image encoding
+    img_batch_size  : images per forward pass
     e5_tokenizer    : HuggingFace tokenizer for the E5 model (text search)
     e5_model        : HuggingFace E5 model
     e5_device       : torch device string, e.g. "cuda" or "cpu"
@@ -44,6 +57,11 @@ class CombinedNN(CounterfactualGenerator):
         k_search: int = 50,
         static_dist_fn: Callable = euclidean_distances,
         ts_dist_fn: Callable = dtw_distance,
+        img_embed_fn: Optional[Callable] = None,
+        image_encoder: str = "precomputed",
+        img_distance_metric: str = "cosine",
+        img_device: Optional[str] = None,
+        img_batch_size: int = 32,
         e5_tokenizer=None,
         e5_model=None,
         e5_device=None,
@@ -54,6 +72,11 @@ class CombinedNN(CounterfactualGenerator):
         self.k_search = k_search
         self.static_dist_fn = static_dist_fn
         self.ts_dist_fn = ts_dist_fn
+        self.img_embed_fn = img_embed_fn
+        self.image_encoder = image_encoder
+        self.img_distance_metric = img_distance_metric
+        self.img_device = img_device
+        self.img_batch_size = img_batch_size
         self.e5_tokenizer = e5_tokenizer
         self.e5_model = e5_model
         self.e5_device = e5_device
@@ -68,8 +91,8 @@ class CombinedNN(CounterfactualGenerator):
         Parameters
         ----------
         active_idx_dist : dict role -> (idx_dict, dist_dict)
-            ``"tabular"`` is always present; time-series modality names (any
-            string keys from ``dataset.X_train_ts``) and ``"text"`` are optional.
+            Any combination of ``"tabular"``, time-series / named-tabular keys,
+            ``"text"``, and ``"image"``.
         sample_idx : int
         k : int
         dataset : MultimodalDataset
@@ -103,7 +126,10 @@ class CombinedNN(CounterfactualGenerator):
         selected = common_arr[sel]
 
         # Gather train arrays.
-        train_static = np.asarray(dataset.X_train_static)
+        train_static = (
+            np.asarray(dataset.X_train_static)
+            if dataset.X_train_static is not None else None
+        )
         train_ts_dict = {
             ts_name: np.asarray(arr)
             for ts_name, arr in (dataset.X_train_ts or {}).items()
@@ -117,6 +143,7 @@ class CombinedNN(CounterfactualGenerator):
             if dataset.X_train_text is not None
             else None
         )
+        train_img = dataset.X_train_img   # kept as-is (rank-matched)
 
         results = []
         n_avail = len(selected)
@@ -125,7 +152,10 @@ class CombinedNN(CounterfactualGenerator):
             subset = selected[:use_n]
             anchor = int(selected[i - 1])   # rank-matched: candidate i → neighbor i
 
-            static_med = np.asarray(np.median(train_static[subset], axis=0), dtype=float)
+            static_med = (
+                np.asarray(np.median(train_static[subset], axis=0), dtype=float)
+                if train_static is not None else None
+            )
             ts_meds = {
                 ts_name: np.asarray(np.median(arr[subset], axis=0), dtype=float)
                 for ts_name, arr in train_ts_dict.items()
@@ -136,6 +166,7 @@ class CombinedNN(CounterfactualGenerator):
             }
             text_val = str(train_text[anchor]) if train_text is not None else None
             text_input = train_text[anchor] if train_text is not None else None
+            img_val = train_img[anchor] if train_img is not None else None
 
             results.append(
                 {
@@ -144,6 +175,8 @@ class CombinedNN(CounterfactualGenerator):
                     "tab": tab_meds,
                     "text": text_val,
                     "text_input": text_input,
+                    "image": img_val,
+                    "image_input": img_val,
                     "source_train_idx": anchor,
                     "n_neighbors_used": int(use_n),
                 }
@@ -175,10 +208,11 @@ class CombinedNN(CounterfactualGenerator):
             corresponding internal unimodal search::
 
                 {
-                    "tabular":   (indices_dict, distances_dict),
-                    <ts_name>:   (indices_dict, distances_dict),  # one per ts key
-                    "text":      (indices_dict, distances_dict),
+                    "tabular":        (indices_dict, distances_dict),
+                    <ts_name>:        (indices_dict, distances_dict),
+                    "text":           (indices_dict, distances_dict),
                     "train_text_str": [...],
+                    "image":          (indices_dict, distances_dict),
                 }
 
             Missing keys are computed on-the-fly.
@@ -187,27 +221,29 @@ class CombinedNN(CounterfactualGenerator):
         pc = precomputed or {}
         avail = dataset.available_modalities
 
-        # --- static NN (always required) ---
-        if "tabular" in pc:
-            idx_static, dist_static = pc["tabular"]
-        else:
-            idx_static, dist_static = find_k_closest_static(
-                X_train_static=dataset.X_train_static,
-                y_train=dataset.y_train,
-                X_test_static=dataset.X_test_static,
-                selected_test_indices=[sample_idx],
-                target_value=target_value,
-                k=self.k_search,
-                distance_fn=self.static_dist_fn,
-                return_indices=True,
-            )
+        # --- static NN (only when tabular modality is present) ---
+        active_idx_dist: dict = {}
+        if "tabular" in avail:
+            if "tabular" in pc:
+                idx_static, dist_static = pc["tabular"]
+            else:
+                idx_static, dist_static = find_k_closest_static(
+                    X_train_static=dataset.X_train_static,
+                    y_train=dataset.y_train,
+                    X_test_static=dataset.X_test_static,
+                    selected_test_indices=[sample_idx],
+                    target_value=target_value,
+                    k=self.k_search,
+                    distance_fn=self.static_dist_fn,
+                    return_indices=True,
+                )
+            active_idx_dist["tabular"] = (idx_static, dist_static)
 
-        # --- per-ts NN (one search per key in X_train_ts) ---
-        ts_idx_dist: Dict[str, tuple] = {}
+        # --- per-ts NN ---
         for ts_name in list((dataset.X_train_ts or {}).keys()):
             if ts_name in avail:
                 if ts_name in pc:
-                    ts_idx_dist[ts_name] = pc[ts_name]
+                    active_idx_dist[ts_name] = pc[ts_name]
                 else:
                     idx_ts, dist_ts = find_k_closest_ts(
                         X_train_ts=dataset.X_train_ts[ts_name],
@@ -219,14 +255,13 @@ class CombinedNN(CounterfactualGenerator):
                         distance_fn=self.ts_dist_fn,
                         return_indices=True,
                     )
-                    ts_idx_dist[ts_name] = (idx_ts, dist_ts)
+                    active_idx_dist[ts_name] = (idx_ts, dist_ts)
 
-        # --- per-named-tabular NN (one search per key in X_train_tab) ---
-        tab_idx_dist: Dict[str, tuple] = {}
+        # --- per-named-tabular NN ---
         for tab_name in list((dataset.X_train_tab or {}).keys()):
             if tab_name in avail:
                 if tab_name in pc:
-                    tab_idx_dist[tab_name] = pc[tab_name]
+                    active_idx_dist[tab_name] = pc[tab_name]
                 else:
                     idx_tab, dist_tab = find_k_closest_static(
                         X_train_static=dataset.X_train_tab[tab_name],
@@ -238,15 +273,14 @@ class CombinedNN(CounterfactualGenerator):
                         distance_fn=self.static_dist_fn,
                         return_indices=True,
                     )
-                    tab_idx_dist[tab_name] = (idx_tab, dist_tab)
+                    active_idx_dist[tab_name] = (idx_tab, dist_tab)
 
-        # --- text NN (skipped when not in dataset) ---
-        idx_text = dist_text = None
+        # --- text NN ---
         if "text" in avail:
             train_text_str = pc.get("train_text_str") or self._to_str_list(dataset.X_train_text)
             test_text_str = self._to_str_list(dataset.X_test_text)
             if "text" in pc:
-                idx_text, dist_text = pc["text"]
+                active_idx_dist["text"] = pc["text"]
             else:
                 ts_list = list((dataset.X_train_ts or {}).values())
                 train_ts1 = ts_list[0] if len(ts_list) > 0 else None
@@ -274,14 +308,30 @@ class CombinedNN(CounterfactualGenerator):
                     train_text_raw=dataset.X_train_text,
                     test_text_raw=dataset.X_test_text,
                 )
+                active_idx_dist["text"] = (idx_text, dist_text)
 
-        # --- combine: intersect + rank ---
-        active_idx_dist: dict = {"tabular": (idx_static, dist_static)}
-        for ts_name, (idx_ts, dist_ts) in ts_idx_dist.items():
-            active_idx_dist[ts_name] = (idx_ts, dist_ts)
-        for tab_name, (idx_tab, dist_tab) in tab_idx_dist.items():
-            active_idx_dist[tab_name] = (idx_tab, dist_tab)
-        if idx_text is not None:
-            active_idx_dist["text"] = (idx_text, dist_text)
+        # --- image NN ---
+        if "image" in avail:
+            if "image" in pc:
+                active_idx_dist["image"] = pc["image"]
+            else:
+                idx_image, dist_image = find_k_closest_image(
+                    X_train_img=dataset.X_train_img,
+                    y_train=dataset.y_train,
+                    X_test_img=dataset.X_test_img,
+                    selected_test_indices=[sample_idx],
+                    target_value=target_value,
+                    k=self.k_search,
+                    image_encoder=self.image_encoder,
+                    image_distance_metric=self.img_distance_metric,
+                    embed_fn=self.img_embed_fn,
+                    device=self.img_device,
+                    batch_size=self.img_batch_size,
+                )
+                active_idx_dist["image"] = (idx_image, dist_image)
+
+        if not active_idx_dist:
+            print("[CombinedNN] no modalities available for this dataset — returning empty candidates.")
+            return []
 
         return self._combined_partial(active_idx_dist, sample_idx, k, dataset)
