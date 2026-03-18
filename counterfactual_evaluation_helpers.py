@@ -43,6 +43,13 @@ def outcome_objective(pred, y_target):
 TEXT_MAX_PENALTY_PROX = 2.0
 TEXT_MAX_PENALTY_PLAUS = 1.0
 
+################################################################
+# Image-specific objectives (embedding-based)
+################################################################
+
+IMAGE_MAX_PENALTY_PROX = 2.0
+IMAGE_MAX_PENALTY_PLAUS = 1.0
+
 
 def embed_e5(
     texts: List[str],
@@ -125,6 +132,146 @@ def embed_e5(
     return np.concatenate(out_chunks, axis=0)
 
 
+def _embed_with_cache(
+    texts: List[str],
+    *,
+    embed_fn,
+    embedding_cache: dict,
+) -> List[np.ndarray]:
+    """Embed ``texts`` using ``embed_fn``, reading/writing ``embedding_cache``.
+
+    Returns a list of 1-D embedding arrays in the same order as ``texts``.
+    ``embed_fn`` must accept a list of strings and return a 2-D ndarray
+    (n_texts, embed_dim).
+    """
+    results = [None] * len(texts)
+    missing_indices = []
+    missing_texts = []
+
+    with _EMBEDDING_CACHE_LOCK:
+        for i, t in enumerate(texts):
+            cached = embedding_cache.get(t)
+            if cached is not None:
+                results[i] = cached
+            else:
+                missing_indices.append(i)
+                missing_texts.append(t)
+
+    if missing_texts:
+        new_embs = embed_fn(missing_texts)
+        with _EMBEDDING_CACHE_LOCK:
+            for i, t, emb in zip(missing_indices, missing_texts, new_embs):
+                embedding_cache[t] = emb
+                results[i] = emb
+
+    return results  # type: ignore[return-value]
+
+
+def _embed_images_with_cache(images, *, embed_fn, embedding_cache: dict) -> list:
+    """Embed a list of images using ``embed_fn``, reading/writing ``embedding_cache``.
+
+    Cache key: ``tobytes()`` for numpy arrays (shape + dtype included),
+    ``id()`` for all other objects (PIL images, etc.).
+
+    Returns a list of 1-D float64 embedding arrays in the same order as ``images``.
+    ``embed_fn`` must accept a list of image objects and return a 2-D ndarray
+    ``(n_images, embed_dim)``.
+    """
+    def _cache_key(img):
+        if isinstance(img, np.ndarray):
+            return ("__img_arr__", img.tobytes(), img.shape, img.dtype.str)
+        return ("__img_id__", id(img))
+
+    results = [None] * len(images)
+    missing_indices = []
+    missing_images = []
+
+    with _EMBEDDING_CACHE_LOCK:
+        for i, img in enumerate(images):
+            key = _cache_key(img)
+            cached = embedding_cache.get(key)
+            if cached is not None:
+                results[i] = cached
+            else:
+                missing_indices.append((i, key))
+                missing_images.append(img)
+
+    if missing_images:
+        new_embs = np.asarray(embed_fn(missing_images), dtype=float)
+        with _EMBEDDING_CACHE_LOCK:
+            for (i, key), emb in zip(missing_indices, new_embs):
+                embedding_cache[key] = emb
+                results[i] = emb
+
+    return results  # type: ignore[return-value]
+
+
+def _make_embed_fn_from_e5_kwargs(*, tokenizer, model, device, **_):
+    """Build a plain ``embed_fn(texts) -> np.ndarray`` from E5 model objects."""
+    def _fn(texts: List[str]) -> np.ndarray:
+        return embed_e5(texts, tokenizer=tokenizer, model=model, device=device)
+    return _fn
+
+
+def _resolve_embed_fn(context: dict):
+    """Return an ``embed_fn`` from a text objective context dict.
+
+    Priority:
+      1. ``context["embed_fn"]``              — already a callable, use directly
+      2. ``context["e5_tokenizer"]`` + ``context["e5_model"]`` + ``context["e5_device"]``
+      3. ``context["tokenizer"]`` + ``context["e5_model"]`` + ``context["device"]``
+         (legacy key names)
+
+    Returns None if no embedding backend is available.
+    """
+    fn = context.get("embed_fn")
+    if callable(fn):
+        return fn
+
+    # E5 explicit keys
+    tok = context.get("e5_tokenizer") or context.get("tokenizer")
+    mdl = context.get("e5_model")
+    dev = context.get("e5_device") or context.get("device")
+    if tok is not None and mdl is not None and dev is not None:
+        return _make_embed_fn_from_e5_kwargs(tokenizer=tok, model=mdl, device=dev)
+
+    return None
+
+
+def text_proximity_embedding(
+    text_factual: str,
+    text_candidate: str,
+    *,
+    embed_fn,
+    max_penalty: float = TEXT_MAX_PENALTY_PROX,
+    embedding_cache: dict = None,
+) -> float:
+    """Cosine-distance proximity in any embedding space (lower is better).
+
+    Parameters
+    ----------
+    embed_fn
+        Callable ``(List[str]) -> np.ndarray`` of shape ``(n, dim)``.
+        Embeddings should be L2-normalised so that cosine similarity equals
+        the dot product, but this is not strictly required.
+    embedding_cache
+        Optional dict keyed by text string. Updated in place.
+    """
+    if text_candidate is None or str(text_candidate).strip() == "":
+        return float(max_penalty)
+    if embedding_cache is None:
+        embedding_cache = {}
+
+    try:
+        texts = [text_factual or "", text_candidate]
+        emb_f, emb_c = _embed_with_cache(texts, embed_fn=embed_fn, embedding_cache=embedding_cache)
+        cos = float(np.sum(emb_f * emb_c))
+        return float(np.clip(1.0 - cos, 0.0, float(max_penalty)))
+    except Exception:
+        return float(max_penalty)
+
+
+# Backward-compat alias — accepts tokenizer/model/device kwargs
 def text_proximity_e5(
     text_factual: str,
     text_candidate: str,
@@ -135,47 +282,14 @@ def text_proximity_e5(
     max_penalty: float = TEXT_MAX_PENALTY_PROX,
     embedding_cache: dict = None,
 ) -> float:
-    """E5 cosine-distance proximity objective (lower is better)."""
-    if text_candidate is None or str(text_candidate).strip() == "":
-        return float(max_penalty)
-
-    try:
-        with _EMBEDDING_CACHE_LOCK:
-            if embedding_cache is None:
-                embedding_cache = {}
-            emb_f = embedding_cache.get(text_factual or "")
-            emb_c = embedding_cache.get(text_candidate)
-
-        texts_to_embed = []
-        indices_to_update = []
-        if emb_f is None:
-            texts_to_embed.append(text_factual or "")
-            indices_to_update.append(0)
-        if emb_c is None:
-            texts_to_embed.append(text_candidate)
-            indices_to_update.append(1)
-
-        if texts_to_embed:
-            new_emb = embed_e5(
-                texts_to_embed,
-                tokenizer=tokenizer,
-                model=model,
-                device=device,
-                batch_size=len(texts_to_embed),
-            )
-            with _EMBEDDING_CACHE_LOCK:
-                for i, emb in zip(indices_to_update, new_emb):
-                    if i == 0:
-                        embedding_cache[text_factual or ""] = emb
-                        emb_f = emb
-                    elif i == 1:
-                        embedding_cache[text_candidate] = emb
-                        emb_c = emb
-        cos = float(np.sum(emb_f * emb_c))
-        prox_txt = 1.0 - cos
-        return float(np.clip(prox_txt, 0.0, float(max_penalty)))
-    except Exception:
-        return float(max_penalty)
+    """E5 cosine-distance proximity. Prefer ``text_proximity_embedding`` with a custom ``embed_fn``."""
+    embed_fn = _make_embed_fn_from_e5_kwargs(tokenizer=tokenizer, model=model, device=device)
+    return text_proximity_embedding(
+        text_factual, text_candidate,
+        embed_fn=embed_fn,
+        max_penalty=max_penalty,
+        embedding_cache=embedding_cache,
+    )
 
 
 def percentile_rank(a: Sequence[float], x: float) -> float:
@@ -191,34 +305,40 @@ def text_plausibility_lof(
     *,
     lof_model_txt,
     train_raw_scores_txt: np.ndarray,
-    tokenizer,
-    model,
-    device,
+    embed_fn=None,
+    # Backward-compat: accept old tokenizer/model/device kwargs
+    tokenizer=None,
+    model=None,
+    device=None,
     max_penalty: float = TEXT_MAX_PENALTY_PLAUS,
     embedding_cache: dict = None,
+    # Absorb extra keys from fit_text_lof_reference output (e.g. train_embs_txt)
+    **_,
 ) -> float:
-    """LOF plausibility percentile in [0,1] (lower is better)."""
+    """LOF plausibility percentile in [0,1] (lower is better).
+
+    Parameters
+    ----------
+    embed_fn
+        Callable ``(List[str]) -> np.ndarray``. Replaces the old
+        ``tokenizer``/``model``/``device`` trio. Either ``embed_fn`` or
+        the legacy trio must be provided.
+    """
     if text_candidate is None or str(text_candidate).strip() == "":
         return float(max_penalty)
 
-    try:
-        with _EMBEDDING_CACHE_LOCK:
-            if embedding_cache is None:
-                embedding_cache = {}
-            emb = embedding_cache.get(text_candidate)
+    # Resolve embed_fn from compat kwargs if not given directly
+    if embed_fn is None and tokenizer is not None and model is not None and device is not None:
+        embed_fn = _make_embed_fn_from_e5_kwargs(tokenizer=tokenizer, model=model, device=device)
+    if embed_fn is None:
+        raise ValueError(
+            "text_plausibility_lof requires either embed_fn or (tokenizer, model, device)."
+        )
+    if embedding_cache is None:
+        embedding_cache = {}
 
-        if emb is None:
-            emb = embed_e5(
-                [str(text_candidate)],
-                tokenizer=tokenizer,
-                model=model,
-                device=device,
-                batch_size=1,
-                max_length=512,
-                prefix="query: ",
-            )[0]
-            with _EMBEDDING_CACHE_LOCK:
-                embedding_cache[text_candidate] = emb
+    try:
+        (emb,) = _embed_with_cache([str(text_candidate)], embed_fn=embed_fn, embedding_cache=embedding_cache)
         raw_score = -float(lof_model_txt.score_samples(emb.reshape(1, -1))[0])
         plaus_txt = percentile_rank(train_raw_scores_txt, raw_score)
         return float(np.clip(plaus_txt, 0.0, 1.0))
@@ -229,21 +349,57 @@ def text_plausibility_lof(
 def fit_text_lof_reference(
     train_texts: List[str],
     *,
-    tokenizer,
-    model,
-    device,
+    y_train: np.ndarray = None,
+    target_value: int = None,
+    embed_fn=None,
+    # Backward-compat: accept old tokenizer/model/device kwargs
+    tokenizer=None,
+    model=None,
+    device=None,
     n_neighbors: int = 20,
 ) -> dict:
-    """One-time helper: fit LOF on training E5 embeddings and cache raw scores."""
-    embs = embed_e5(
-        train_texts,
-        tokenizer=tokenizer,
-        model=model,
-        device=device,
-        batch_size=32,
-        max_length=512,
-        prefix="query: ",
-    )
+    """Fit LOF on training text embeddings and return reference dict.
+
+    Parameters
+    ----------
+    train_texts
+        All training texts (aligned with ``y_train`` when provided).
+    y_train
+        Integer class labels aligned with ``train_texts``. When provided
+        together with ``target_value``, LOF is fitted on the target-class
+        texts only, so the plausibility score reflects how typical a
+        candidate text is *within the desired class*.
+    target_value
+        Class label to filter on. Required when ``y_train`` is provided.
+    embed_fn
+        Callable ``(List[str]) -> np.ndarray``. Replaces the old
+        ``tokenizer``/``model``/``device`` trio. Either ``embed_fn`` or
+        the legacy trio must be provided.
+
+    Returns
+    -------
+    dict with keys ``lof_model_txt``, ``train_raw_scores_txt``, ``train_embs_txt``.
+    Pass this dict (or its contents) into ``text_plausibility_lof`` or
+    the ``"context"`` of a ``text_modalities`` spec.
+    """
+    if embed_fn is None and tokenizer is not None and model is not None and device is not None:
+        embed_fn = _make_embed_fn_from_e5_kwargs(tokenizer=tokenizer, model=model, device=device)
+    if embed_fn is None:
+        raise ValueError(
+            "fit_text_lof_reference requires either embed_fn or (tokenizer, model, device)."
+        )
+
+    texts_to_fit = list(train_texts)
+    if y_train is not None and target_value is not None:
+        y = np.asarray(y_train).reshape(-1)
+        target_idx = np.flatnonzero(y == target_value)
+        if len(target_idx) == 0:
+            raise ValueError(
+                f"fit_text_lof_reference: no training samples with target_value={target_value}."
+            )
+        texts_to_fit = [train_texts[i] for i in target_idx]
+
+    embs = embed_fn(texts_to_fit)
     if embs.shape[0] < 3:
         raise ValueError("Need at least 3 training texts to fit LOF plausibility model.")
 
@@ -286,6 +442,206 @@ def text_sparsity_token_edit(tokens_factual: List[str], tokens_candidate: List[s
     edits = _token_levenshtein_distance(t1, t2)
     denom = max(1, len(t1))
     return float(edits) / float(denom)
+
+
+################################################################
+# Image objectives (mirrors text: cosine proximity, L1 sparsity, LOF plausibility)
+################################################################
+
+def image_proximity_embedding(
+    image_factual,
+    image_candidate,
+    *,
+    embed_fn,
+    max_penalty: float = IMAGE_MAX_PENALTY_PROX,
+    embedding_cache: dict = None,
+) -> float:
+    """Cosine-distance proximity in image embedding space (lower is better).
+
+    Mirrors ``text_proximity_embedding``. Embeddings are L2-normalised before
+    computing cosine similarity, so the result lies in ``[0, max_penalty]``.
+
+    Parameters
+    ----------
+    embed_fn
+        Callable ``(List[images]) -> np.ndarray`` of shape ``(n, dim)``.
+    """
+    if image_candidate is None:
+        return float(max_penalty)
+    if embedding_cache is None:
+        embedding_cache = {}
+    try:
+        emb_f, emb_c = _embed_images_with_cache(
+            [image_factual, image_candidate], embed_fn=embed_fn, embedding_cache=embedding_cache
+        )
+        emb_f = np.asarray(emb_f, dtype=float)
+        emb_c = np.asarray(emb_c, dtype=float)
+        norm_f = np.linalg.norm(emb_f)
+        norm_c = np.linalg.norm(emb_c)
+        if norm_f > 1e-8:
+            emb_f = emb_f / norm_f
+        if norm_c > 1e-8:
+            emb_c = emb_c / norm_c
+        cos = float(np.dot(emb_f, emb_c))
+        return float(np.clip(1.0 - cos, 0.0, float(max_penalty)))
+    except Exception:
+        return float(max_penalty)
+
+
+def image_sparsity_embedding(
+    image_factual,
+    image_candidate,
+    *,
+    embed_fn,
+    embedding_cache: dict = None,
+) -> float:
+    """L1 distance in embedding space normalised by dimensionality (lower is better).
+
+    Mirrors the spirit of ``text_sparsity_token_edit`` (edit fraction in token
+    space) but operates in continuous embedding space: how much does the
+    embedding change per dimension?  Result lies in ``[0, ∞)`` but is typically
+    small for embeddings from the same distribution.
+    """
+    if image_candidate is None:
+        return 1.0
+    if embedding_cache is None:
+        embedding_cache = {}
+    try:
+        emb_f, emb_c = _embed_images_with_cache(
+            [image_factual, image_candidate], embed_fn=embed_fn, embedding_cache=embedding_cache
+        )
+        emb_f = np.asarray(emb_f, dtype=float)
+        emb_c = np.asarray(emb_c, dtype=float)
+        dim = max(1, emb_f.shape[0])
+        return float(np.sum(np.abs(emb_f - emb_c)) / dim)
+    except Exception:
+        return 1.0
+
+
+def image_plausibility_lof(
+    image_candidate,
+    *,
+    lof_model_img,
+    train_raw_scores_img: np.ndarray,
+    embed_fn,
+    max_penalty: float = IMAGE_MAX_PENALTY_PLAUS,
+    embedding_cache: dict = None,
+    **_,
+) -> float:
+    """LOF plausibility percentile in [0, 1] in image embedding space (lower is better).
+
+    Mirrors ``text_plausibility_lof``. The LOF model should be fitted on
+    target-class training embeddings only (see ``fit_image_lof``).
+
+    Parameters
+    ----------
+    lof_model_img
+        A fitted ``LocalOutlierFactor(novelty=True)`` instance.
+    train_raw_scores_img
+        Raw LOF outlierness scores (``-score_samples``) for the training
+        embeddings used to fit ``lof_model_img``. Used to compute the
+        percentile rank of the candidate.
+    embed_fn
+        Callable ``(List[images]) -> np.ndarray``.
+    """
+    if image_candidate is None:
+        return float(max_penalty)
+    if embedding_cache is None:
+        embedding_cache = {}
+    try:
+        (emb,) = _embed_images_with_cache(
+            [image_candidate], embed_fn=embed_fn, embedding_cache=embedding_cache
+        )
+        emb = np.asarray(emb, dtype=float)
+        raw_score = -float(lof_model_img.score_samples(emb.reshape(1, -1))[0])
+        plaus = percentile_rank(train_raw_scores_img, raw_score)
+        return float(np.clip(plaus, 0.0, 1.0))
+    except Exception:
+        return float(max_penalty)
+
+
+def fit_image_lof(
+    X_train_img,
+    y_train: np.ndarray,
+    target_value: int,
+    embed_fn,
+    *,
+    n_neighbors: int = 20,
+    q_low: float = 5.0,
+    q_high: float = 95.0,
+    batch_size: int = 32,
+) -> dict:
+    """Fit LOF on *target-class* image embeddings for plausibility scoring.
+
+    Unlike ``fit_text_lof_reference`` (which uses all training samples), this
+    function filters to ``target_value`` only, so the plausibility score
+    reflects how typical a candidate image is *within the desired class* — a
+    candidate can be a genuine outlier from that class even though it is a real
+    training image from a different class.
+
+    Parameters
+    ----------
+    X_train_img
+        Indexable collection of training images (list, ndarray, …).
+    y_train
+        Integer class labels aligned with ``X_train_img``.
+    target_value
+        Class label whose training images are used to fit LOF.
+    embed_fn
+        Callable ``(List[images]) -> np.ndarray`` of shape ``(n, dim)``.
+    n_neighbors
+        ``k`` for ``LocalOutlierFactor``.
+    q_low, q_high
+        Percentiles of the training LOF scores used as calibration bounds.
+    batch_size
+        Number of images per ``embed_fn`` call.
+
+    Returns
+    -------
+    dict
+        Compatible with the ``"context"`` key of an ``image_modalities`` spec::
+
+            {
+                "embed_fn":              embed_fn,
+                "lof_model_img":         fitted LocalOutlierFactor,
+                "train_raw_scores_img":  np.ndarray of raw outlierness scores,
+                "lof_low":               float (q_low percentile),
+                "lof_high":              float (q_high percentile),
+            }
+    """
+    y = np.asarray(y_train).reshape(-1)
+    target_idx = np.flatnonzero(y == target_value)
+    if len(target_idx) == 0:
+        raise ValueError(
+            f"fit_image_lof: no training samples with target_value={target_value}."
+        )
+    if len(target_idx) < 3:
+        raise ValueError(
+            f"fit_image_lof: need at least 3 target-class samples to fit LOF, "
+            f"got {len(target_idx)} for target_value={target_value}."
+        )
+
+    target_images = [X_train_img[i] for i in target_idx]
+
+    all_embs = []
+    for i in range(0, len(target_images), max(1, int(batch_size))):
+        batch = target_images[i : i + max(1, int(batch_size))]
+        all_embs.append(np.asarray(embed_fn(batch), dtype=float))
+    Z = np.concatenate(all_embs, axis=0)
+
+    k = max(2, min(int(n_neighbors), len(Z) - 1))
+    lof = LocalOutlierFactor(n_neighbors=k, metric="euclidean", novelty=True)
+    lof.fit(Z)
+    raw_scores = -np.asarray(lof.score_samples(Z), dtype=float)
+    low, high = np.percentile(raw_scores, [q_low, q_high]).astype(float)
+
+    return {
+        "embed_fn": embed_fn,
+        "lof_model_img": lof,
+        "train_raw_scores_img": raw_scores,
+        "lof_low": float(low),
+        "lof_high": float(high),
+    }
 
 
 def _n_model_inputs(model_like) -> int:
@@ -678,12 +1034,35 @@ def fit_plausibility_normalizer(
     X_ts_obs,
     q_low: float = 5.0,
     q_high: float = 95.0,
+    *,
+    y_train: np.ndarray = None,
+    target_value: int = None,
 ):
     """Fit reusable calibration for merged tabular+TS plausibility.
 
     Returns a dict with fitted LOF models and robust score bounds used to
     normalize tabular and time-series plausibility onto a shared [0, 1] scale.
+
+    Parameters
+    ----------
+    y_train
+        Integer class labels aligned with ``X_tab_obs`` / ``X_ts_obs``. When
+        provided together with ``target_value``, LOF is fitted on the
+        target-class samples only, so the plausibility score reflects how
+        typical a candidate is *within the desired class*.
+    target_value
+        Class label to filter on. Required when ``y_train`` is provided.
     """
+    if y_train is not None and target_value is not None:
+        y = np.asarray(y_train).reshape(-1)
+        target_idx = np.flatnonzero(y == target_value)
+        if X_tab_obs is not None:
+            X_tab_obs = np.asarray(X_tab_obs)[target_idx]
+        if _is_split_ts_dict(X_ts_obs):
+            X_ts_obs = {k: np.asarray(v)[target_idx] for k, v in X_ts_obs.items()}
+        elif X_ts_obs is not None:
+            X_ts_obs = np.asarray(X_ts_obs)[target_idx]
+
     X_tab_obs = np.asarray(X_tab_obs)
 
     n_tab_obs = int(len(X_tab_obs))
@@ -833,22 +1212,17 @@ def normalized_merged_plausibility(
 
     w_tab = float(np.clip(tab_weight, 0.0, 1.0))
     w_ts = 1.0 - w_tab
-    return float(w_tab * tab_norm + w_ts * ts_norm)
     base_plaus = float(w_tab * tab_norm + w_ts * ts_norm)
 
     if text_objective_context is not None:
-        tok = text_objective_context.get("tokenizer", None)
-        e5_model = text_objective_context.get("e5_model", None)
-        e5_device = text_objective_context.get("device", None)
         lof_model_txt = text_objective_context.get("lof_model_txt", None)
         train_raw_scores_txt = text_objective_context.get("train_raw_scores_txt", None)
         if embedding_cache is None:
             embedding_cache = text_objective_context.get("embedding_cache", {})
+        _embed_fn = _resolve_embed_fn(text_objective_context)
 
         if (
-            tok is not None
-            and e5_model is not None
-            and e5_device is not None
+            _embed_fn is not None
             and lof_model_txt is not None
             and train_raw_scores_txt is not None
         ):
@@ -856,9 +1230,7 @@ def normalized_merged_plausibility(
                 text_candidate=text_candidate,
                 lof_model_txt=lof_model_txt,
                 train_raw_scores_txt=train_raw_scores_txt,
-                tokenizer=tok,
-                model=e5_model,
-                device=e5_device,
+                embed_fn=_embed_fn,
                 embedding_cache=embedding_cache,
             )
 
@@ -895,28 +1267,26 @@ def multimodal_proximity(
     time-series proximity (`ts_proximity`) into a single objective.
     This combines:
     - Tabular proximity (`tabular_proximity`).
-    - Time-series proximity (`ts_proximity`).
+    - Time-series proximity (`ts_proximity`), only when x_ts and x_ts_ref are provided.
     - Text proximity (`text_proximity_e5`), if text context is provided.
 
     If text is included, the final score is a weighted sum based on weights
     in `text_objective_context`.
     """
-    base_prox = float(tabular_proximity(x_tab, x_tab_ref)) + float(ts_proximity(x_ts, x_ts_ref))
+    base_prox = float(tabular_proximity(x_tab, x_tab_ref))
+    if x_ts is not None and x_ts_ref is not None:
+        base_prox += float(ts_proximity(x_ts, x_ts_ref))
 
     if text_objective_context is not None:
-        tok = text_objective_context.get("tokenizer", None)
-        e5_model = text_objective_context.get("e5_model", None)
-        e5_device = text_objective_context.get("device", None)
         if embedding_cache is None:
             embedding_cache = text_objective_context.get("embedding_cache", {})
+        _embed_fn = _resolve_embed_fn(text_objective_context)
 
-        if tok is not None and e5_model is not None and e5_device is not None:
-            prox_txt = text_proximity_e5(
+        if _embed_fn is not None:
+            prox_txt = text_proximity_embedding(
                 text_factual=text_factual,
                 text_candidate=text_candidate,
-                tokenizer=tok,
-                model=e5_model,
-                device=e5_device,
+                embed_fn=_embed_fn,
                 embedding_cache=embedding_cache,
             )
             w_base_prox = float(text_objective_context.get("w_base_prox", 1.0))
@@ -956,9 +1326,9 @@ def multimodal_sparsity(
     If text is included, the final score is a weighted sum based on weights
     in `text_objective_context`.
     """
-    base_sparse = float(tabular_sparsity(x_tab, x_tab_ref)) + float(
-        ts_segment_sparsity(x_ts, x_ts_ref, segments, tau_c, rho)
-    )
+    base_sparse = float(tabular_sparsity(x_tab, x_tab_ref))
+    if x_ts is not None and x_ts_ref is not None and segments is not None and tau_c is not None:
+        base_sparse += float(ts_segment_sparsity(x_ts, x_ts_ref, segments, tau_c, rho))
 
     if text_objective_context is not None and text_tokens_factual is not None and text_tokens_candidate is not None:
         sparse_txt = text_sparsity_token_edit(text_tokens_factual, text_tokens_candidate)
@@ -1052,205 +1422,388 @@ def compute_tau_c(X_ts_obs, factor=1.1):
 ################################################################
 
 def compute_objectives(
-    x_tab,
-    x_ts,
-    x_tab_ref,
-    x_ts_ref,
-    X_tab_obs,
-    X_ts_obs,
-    model,
-    segments,
-    tau_c,
-    y_target,
-    rho=0.0,
-    plausibility_normalizer=None,
-    tab_plausibility_weight: float = 0.5,
-    text_factual: str = None,
+    *,
+    # --- dict-based modalities (new, preferred) ---
+    # tabular_modalities: {name: {"x": ..., "x_ref": ..., "X_obs": ...,
+    #                             "plausibility_normalizer": {"lof": ..., "low": ..., "high": ...}}}
+    tabular_modalities: dict = None,
+    # ts_modalities: {name: {"x": ..., "x_ref": ..., "X_obs": ...,
+    #                        "segments": ..., "tau_c": ..., "rho": 0.0,
+    #                        "plausibility_normalizer": {"lof": ..., "low": ..., "high": ...}}}
+    ts_modalities: dict = None,
+    # text_modalities: {name: {"candidate": ..., "factual": ..., "context": ...,
+    #                          "tokens_candidate": ..., "tokens_factual": ...}}
+    text_modalities: dict = None,
+    # image_modalities: {name: {"factual": img, "candidate": img,
+    #                           "context": {"embed_fn": ...,
+    #                                       "lof_model_img": ...,         # optional
+    #                                       "train_raw_scores_img": ...}}} # optional
+    image_modalities: dict = None,
+    # --- single-instance (old, kept for backward compat) ---
+    x_tab=None,
+    x_tab_ref=None,
+    X_tab_obs=None,
+    x_ts=None,
+    x_ts_ref=None,
+    X_ts_obs=None,
+    segments=None,
+    tau_c=None,
+    rho: float = 0.0,
     text_candidate: str = None,
-    text_tokens_factual: List[str] = None,
+    text_factual: str = None,
     text_tokens_candidate: List[str] = None,
+    text_tokens_factual: List[str] = None,
     text_objective_context: dict = None,
-    text_input_ref=None,
-    text_input_cf=None,
-    embedding_cache: dict = None,
+    # --- outcome ---
+    predict_fn=None,
+    y_target=None,
     pred_override: float = None,
+    # --- per-modality weights (keyed by modality name) ---
+    modality_weights: dict = None,
+    # --- misc ---
+    plausibility_normalizer=None,   # only used with flat (compat) args
+    embedding_cache: dict = None,
     text_metrics_cache: dict = None,
-):
+) -> np.ndarray:
+    """Compute [outcome, proximity, sparsity, plausibility] for a counterfactual candidate.
 
-    """Compute merged objectives for tabular, time-series, and text modalities.
+    Supports multiple instances of the same modality type (e.g., two tabular heads
+    or two text heads) via the dict-based modality arguments. Each named modality
+    contributes independently and can carry its own weight in ``modality_weights``.
 
-    If `text_objective_context` is provided, proximity/sparsity/plausibility
-    objectives are augmented with text-specific terms:
-      - proximity: E5 cosine distance
-      - sparsity: token-level Levenshtein edit fraction
-      - plausibility: LOF percentile in E5 space
-    This function computes four objectives for a counterfactual candidate:
-    1. Outcome: Distance to the target prediction.
-    2. Proximity: A weighted combination of distances in tabular, time-series,
-       and (if provided) text embedding space.
-    3. Sparsity: A weighted combination of feature changes in tabular,
-       time-series, and (if provided) text token space.
-    4. Plausibility: A weighted combination of plausibility scores (LOF-based)
-       for tabular, time-series, and (if provided) text modalities.
+    Parameters
+    ----------
+    tabular_modalities
+        Dict mapping modality name → spec dict with keys:
+        ``x`` (candidate vector), ``x_ref`` (factual vector), ``X_obs``
+        (training matrix), and optionally ``plausibility_normalizer``
+        (dict with ``lof``, ``low``, ``high``).
+    ts_modalities
+        Dict mapping modality name → spec dict with keys:
+        ``x``, ``x_ref``, ``X_obs``, ``segments``, ``tau_c``,
+        optionally ``rho`` (float, default 0.0), and optionally
+        ``plausibility_normalizer`` (dict with ``lof``, ``low``, ``high``).
+    text_modalities
+        Dict mapping modality name → spec dict with keys:
+        ``candidate`` (string), ``factual`` (string), ``context``
+        (objective context dict with E5/BERT backend), optionally
+        ``tokens_candidate`` and ``tokens_factual`` (pre-tokenised lists).
+    x_tab, x_tab_ref, X_tab_obs, ...
+        Flat single-instance args kept for backward compatibility.
+        Auto-promoted to the dict form under ``"__primary__"`` /
+        ``"__primary_ts__"`` / ``"__primary_text__"`` when the
+        corresponding dict-based arg is None.
+    predict_fn
+        Callable that accepts:
 
-    The text-related computations are only performed if `text_objective_context`
-    is provided.
+        - ``(x_tab, x_ts, text_candidate)`` when each modality type has
+          exactly one instance (backward compat); or
+        - ``(tabular_dict, ts_dict, text_dict)`` where each arg is a
+          ``{name: data}`` dict (or None) when multiple instances exist.
+
+        Returns a scalar prediction score. When None and ``pred_override``
+        is also None, the outcome objective is set to NaN.
+    y_target
+        Integer target class label used by ``outcome_objective``.
+    pred_override
+        Skip ``predict_fn`` and use this scalar directly.
+    modality_weights
+        Dict mapping modality name → scalar weight. Keys must match the
+        names in ``tabular_modalities`` / ``ts_modalities`` /
+        ``text_modalities`` (or ``"__primary__"`` etc. for flat-arg paths).
+        Missing keys default to 1.0. Weights are normalised to sum to 1.
+    plausibility_normalizer
+        Used only with the flat (compat) args. Dict with keys
+        ``tab_lof``, ``tab_low``, ``tab_high``, ``ts_lof``, ``ts_low``,
+        ``ts_high``. For the dict-based API embed normalizer info inside
+        each modality spec under ``"plausibility_normalizer"``.
+
+    Returns
+    -------
+    np.ndarray of shape (4,): [outcome, proximity, sparsity, plausibility]
     """
     if embedding_cache is None:
         embedding_cache = {}
-    if pred_override is None:
-        n_in = _n_model_inputs(model)
-        if n_in in (1, 2) and _is_split_ts_dict(x_ts):
-            raise ValueError(
-                "Split TS dict inputs require a 4-input model (meds, labs, static, text)."
-            )
 
-        if n_in == 1:
-            model_input = _concat_tab_ts_single(x_tab, x_ts)
-            pred = _call_keras(model, model_input, training=False)
-        elif n_in == 2:
-            x_tab_b = np.asarray(x_tab)[None, :]
-            x_ts_b = np.asarray(x_ts)[None, :, :]
-            pred = _call_keras(model, [x_tab_b, x_ts_b], training=False)
-        elif n_in == 4:
-            x_tab_b = np.asarray(x_tab)[None, :]
-            if _is_split_ts_dict(x_ts):
-                split = _ensure_split_ts_sample_dict(x_ts, name="x_ts")
-                x_labs_b = split["labs"][None, :, :]
-                x_meds_b = split["meds"][None, :, :]
-            else:
-                x_ts_b = np.asarray(x_ts)[None, :, :]
-                x_labs_b, x_meds_b = _split_ts_for_4input(model, x_ts_b)
-            x_text_src = text_input_cf if text_input_cf is not None else text_input_ref
-            if x_text_src is None:
-                # Backward-compatible fallback: zero text input if no explicit text value is provided.
-                x_text_src = 0.0
-            x_text_b = _coerce_text_input_for_model(
-                x_text_src,
-                model.inputs[3],
-                batch_size=1,
-                timesteps=x_labs_b.shape[1],
-            )
-            pred = _call_keras(model, [x_meds_b, x_labs_b, x_tab_b, x_text_b], training=False)
-        else:
-            raise ValueError(f"Unsupported model with {n_in} inputs")
+    # ------------------------------------------------------------------ compat
+    # Promote flat args → dict form when dict-based args are not provided
+    if tabular_modalities is None:
+        if x_tab is not None and x_tab_ref is not None and X_tab_obs is not None:
+            pn_flat = plausibility_normalizer if isinstance(plausibility_normalizer, dict) else {}
+            tab_pn = None
+            if "tab_lof" in pn_flat:
+                tab_pn = {
+                    "lof": pn_flat["tab_lof"],
+                    "low": pn_flat.get("tab_low", 0.0),
+                    "high": pn_flat.get("tab_high", 1.0),
+                }
+            tabular_modalities = {"__primary__": {
+                "x": x_tab, "x_ref": x_tab_ref, "X_obs": X_tab_obs,
+                "plausibility_normalizer": tab_pn,
+            }}
 
-        pred = float(_to_numpy(pred).squeeze())
-    else:
+    if ts_modalities is None:
+        if (x_ts is not None and x_ts_ref is not None and X_ts_obs is not None
+                and segments is not None and tau_c is not None):
+            pn_flat = plausibility_normalizer if isinstance(plausibility_normalizer, dict) else {}
+            ts_pn = None
+            if "ts_lof" in pn_flat:
+                ts_pn = {
+                    "lof": pn_flat["ts_lof"],
+                    "low": pn_flat.get("ts_low", 0.0),
+                    "high": pn_flat.get("ts_high", 1.0),
+                }
+            ts_modalities = {"__primary_ts__": {
+                "x": x_ts, "x_ref": x_ts_ref, "X_obs": X_ts_obs,
+                "segments": segments, "tau_c": tau_c, "rho": rho,
+                "plausibility_normalizer": ts_pn,
+            }}
+
+    if text_modalities is None:
+        if (text_candidate is not None and text_factual is not None
+                and text_objective_context is not None):
+            text_modalities = {"__primary_text__": {
+                "candidate": text_candidate,
+                "factual": text_factual,
+                "context": text_objective_context,
+                "tokens_candidate": text_tokens_candidate,
+                "tokens_factual": text_tokens_factual,
+            }}
+
+    tabular_modalities = tabular_modalities or {}
+    ts_modalities = ts_modalities or {}
+    text_modalities = text_modalities or {}
+    image_modalities = image_modalities or {}
+
+    if not tabular_modalities and not ts_modalities and not text_modalities and not image_modalities:
+        raise ValueError(
+            "compute_objectives: at least one modality must be fully provided "
+            "(tabular_modalities, ts_modalities, text_modalities, or image_modalities dict; "
+            "or flat compat args x_tab+x_tab_ref+X_tab_obs / "
+            "x_ts+x_ts_ref+X_ts_obs+segments+tau_c / "
+            "text_candidate+text_factual+text_objective_context)."
+        )
+
+    # ------------------------------------------------------------------ weights
+    mw = dict(modality_weights or {})
+    all_names = list(tabular_modalities) + list(ts_modalities) + list(text_modalities) + list(image_modalities)
+    weights = {name: float(mw.get(name, 1.0)) for name in all_names}
+    w_total = sum(weights.values())
+    if w_total < 1e-8:
+        raise ValueError("modality_weights sum to zero.")
+    weights = {name: w / w_total for name, w in weights.items()}
+
+    # ------------------------------------------------------------------ outcome
+    if pred_override is not None:
         pred = float(pred_override)
-    obj_outcome = outcome_objective(pred, y_target)
+    elif predict_fn is not None:
+        n_tab = len(tabular_modalities)
+        n_ts = len(ts_modalities)
+        n_text = len(text_modalities)
+        n_img = len(image_modalities)
+        if n_tab <= 1 and n_ts <= 1 and n_text <= 1 and n_img <= 1:
+            # Single-instance backward compat: call with positional args.
+            # Image is passed as 4th arg only when image_modalities is present,
+            # preserving the old 3-arg signature for callers without images.
+            x_tab_arg = (np.asarray(next(iter(tabular_modalities.values()))["x"])
+                         if tabular_modalities else None)
+            x_ts_arg = (np.asarray(next(iter(ts_modalities.values()))["x"])
+                        if ts_modalities else None)
+            text_arg = (next(iter(text_modalities.values()))["candidate"]
+                        if text_modalities else None)
+            if image_modalities:
+                img_arg = next(iter(image_modalities.values()))["candidate"]
+                pred = float(predict_fn(x_tab_arg, x_ts_arg, text_arg, img_arg))
+            else:
+                pred = float(predict_fn(x_tab_arg, x_ts_arg, text_arg))
+        else:
+            # Multi-instance: pass full {name: data} dicts.
+            # Image dict is passed as 4th arg only when image_modalities is present.
+            tab_dict = {n: np.asarray(s["x"]) for n, s in tabular_modalities.items()} or None
+            ts_dict = {n: np.asarray(s["x"]) for n, s in ts_modalities.items()} or None
+            text_dict = {n: s["candidate"] for n, s in text_modalities.items()} or None
+            if image_modalities:
+                img_dict = {n: s["candidate"] for n, s in image_modalities.items()} or None
+                pred = float(predict_fn(tab_dict, ts_dict, text_dict, img_dict))
+            else:
+                pred = float(predict_fn(tab_dict, ts_dict, text_dict))
+    else:
+        pred = float("nan")
+    obj_outcome = outcome_objective(pred, y_target) if not np.isnan(pred) else float("nan")
 
-    # Pass text-related arguments to the multimodal objective functions
-    obj_prox = multimodal_proximity(
-        x_tab,
-        x_ts,
-        x_tab_ref,
-        x_ts_ref,
-        text_factual=text_factual,
-        text_candidate=text_candidate,
-        text_objective_context=text_objective_context,
-        embedding_cache=embedding_cache,
-    )
-    obj_sparse = multimodal_sparsity(
-        x_tab, x_ts, x_tab_ref, x_ts_ref, segments, tau_c, rho,
-        text_tokens_factual=text_tokens_factual,
-        text_tokens_candidate=text_tokens_candidate,
-        text_objective_context=text_objective_context,
-    )
-    obj_plaus = normalized_merged_plausibility(
-        x_tab, x_ts, X_tab_obs, X_ts_obs,
-        plausibility_normalizer=plausibility_normalizer,
-        tab_weight=tab_plausibility_weight,
-        text_candidate=text_candidate,
-        text_objective_context=text_objective_context,
-        embedding_cache=embedding_cache,
-    )
+    # ---------------------------------------------------------------- accumulators
+    prox_parts: List[tuple] = []
+    sparse_parts: List[tuple] = []
+    plaus_parts: List[tuple] = []
 
-    # Optional text objective augmentation.
-    if text_objective_context is not None:
-        tok = text_objective_context.get("tokenizer", None)
-        e5_model = text_objective_context.get("e5_model", None)
-        e5_device = text_objective_context.get("device", None)
+    # ---------------------------------------------------------------- tabular
+    for name, spec in tabular_modalities.items():
+        x = np.asarray(spec["x"])
+        x_ref = np.asarray(spec["x_ref"])
+        X_obs = np.asarray(spec["X_obs"])
+        w = weights[name]
 
-        w_base_prox = float(text_objective_context.get("w_base_prox", 1.0))
-        w_text_prox = float(text_objective_context.get("w_text_prox", 1.0))
-        w_base_sparse = float(text_objective_context.get("w_base_sparse", 1.0))
-        w_text_sparse = float(text_objective_context.get("w_text_sparse", 1.0))
-        w_base_plaus = float(text_objective_context.get("w_base_plaus", 1.0))
-        w_text_plaus = float(text_objective_context.get("w_text_plaus", 1.0))
-        plaus_merge = text_objective_context.get("plaus_merge", "weighted_mean")
+        prox_parts.append((w, float(tabular_proximity(x, x_ref))))
+        sparse_parts.append((w, float(tabular_sparsity(x, x_ref))))
 
-        # Proximity (E5 cosine distance)
-        txt_key = "" if text_candidate is None else str(text_candidate)
-        cache_bucket = None
-        if text_metrics_cache is not None:
-            cache_bucket = text_metrics_cache.setdefault(txt_key, {})
+        pn = spec.get("plausibility_normalizer") or {}
+        lof = pn.get("lof")
+        if lof is not None:
+            raw = -float(lof.score_samples(x[None, :])[0])
+            tab_plaus = _normalize_unit_interval(
+                raw, float(pn.get("low", 0.0)), float(pn.get("high", 1.0))
+            )
+        else:
+            tab_plaus = float(tabular_plausibility(x, X_obs))
+        plaus_parts.append((w, tab_plaus))
 
-        if tok is not None and e5_model is not None and e5_device is not None:
+    # ---------------------------------------------------------------- time-series
+    for name, spec in ts_modalities.items():
+        x = np.asarray(spec["x"])
+        x_ref = np.asarray(spec["x_ref"])
+        X_obs = np.asarray(spec["X_obs"])
+        segs = spec["segments"]
+        tau = spec["tau_c"]
+        rho_val = float(spec.get("rho", 0.0))
+        w = weights[name]
+
+        prox_parts.append((w, float(ts_proximity(x, x_ref))))
+        sparse_parts.append((w, float(ts_segment_sparsity(x, x_ref, segs, tau, rho_val))))
+
+        pn = spec.get("plausibility_normalizer") or {}
+        lof = pn.get("lof")
+        if lof is not None:
+            raw = -float(lof.score_samples(np.asarray(x).reshape(1, -1))[0])
+            ts_plaus = _normalize_unit_interval(
+                raw, float(pn.get("low", 0.0)), float(pn.get("high", 1.0))
+            )
+        else:
+            ts_plaus = float(ts_plausibility(x, X_obs))
+        plaus_parts.append((w, ts_plaus))
+
+    # ---------------------------------------------------------------- text
+    for name, spec in text_modalities.items():
+        cand = spec["candidate"]
+        fact = spec["factual"]
+        ctx = spec.get("context") or {}
+        tokens_cand = spec.get("tokens_candidate")
+        tokens_fact = spec.get("tokens_factual")
+        w = weights[name]
+
+        _embed_fn = _resolve_embed_fn(ctx)
+
+        # Cache key is candidate text + modality name (supports multiple text heads)
+        txt_key = (str(cand) if cand is not None else "") + f"__{name}"
+        cache_bucket = (text_metrics_cache.setdefault(txt_key, {})
+                        if text_metrics_cache is not None else None)
+
+        # Proximity (cosine in embedding space)
+        if _embed_fn is not None:
             prox_txt = cache_bucket.get("prox_txt") if cache_bucket is not None else None
             if prox_txt is None:
-                prox_txt = text_proximity_e5(
-                    text_factual=text_factual,
-                    text_candidate=text_candidate,
-                    tokenizer=tok,
-                    model=e5_model,
-                    device=e5_device,
+                prox_txt = float(text_proximity_embedding(
+                    text_factual=fact,
+                    text_candidate=cand,
+                    embed_fn=_embed_fn,
                     embedding_cache=embedding_cache,
-                )
+                ))
                 if cache_bucket is not None:
-                    cache_bucket["prox_txt"] = float(prox_txt)
-            obj_prox = (w_base_prox * float(obj_prox)) + (w_text_prox * float(prox_txt))
+                    cache_bucket["prox_txt"] = prox_txt
+            prox_parts.append((w, prox_txt))
 
-        # Sparsity (token edit fraction)
-        tokenize_fn = text_objective_context.get("tokenize_fn", None)
-        if text_tokens_factual is None and text_factual is not None and callable(tokenize_fn):
+        # Sparsity (token edit distance) — auto-tokenise if tokenize_fn available
+        tokenize_fn = ctx.get("tokenize_fn")
+        if tokens_fact is None and callable(tokenize_fn):
             try:
-                text_tokens_factual = list(tokenize_fn(text_factual))
+                tokens_fact = list(tokenize_fn(fact))
             except Exception:
-                text_tokens_factual = []
-        if text_tokens_candidate is None and text_candidate is not None and callable(tokenize_fn):
+                tokens_fact = []
+        if tokens_cand is None and callable(tokenize_fn):
             try:
-                text_tokens_candidate = list(tokenize_fn(text_candidate))
+                tokens_cand = list(tokenize_fn(cand))
             except Exception:
-                text_tokens_candidate = []
-
-        if text_tokens_factual is not None and text_tokens_candidate is not None:
+                tokens_cand = []
+        if tokens_fact is not None and tokens_cand is not None:
             sparse_txt = cache_bucket.get("sparse_txt") if cache_bucket is not None else None
             if sparse_txt is None:
-                sparse_txt = text_sparsity_token_edit(text_tokens_factual, text_tokens_candidate)
+                sparse_txt = float(text_sparsity_token_edit(tokens_fact, tokens_cand))
                 if cache_bucket is not None:
-                    cache_bucket["sparse_txt"] = float(sparse_txt)
-            obj_sparse = (w_base_sparse * float(obj_sparse)) + (w_text_sparse * float(sparse_txt))
+                    cache_bucket["sparse_txt"] = sparse_txt
+            sparse_parts.append((w, sparse_txt))
 
-        # Plausibility (LOF percentile in E5 space)
-        lof_model_txt = text_objective_context.get("lof_model_txt", None)
-        train_raw_scores_txt = text_objective_context.get("train_raw_scores_txt", None)
-        embedding_cache = text_objective_context.get("embedding_cache", {})
-        if (
-            tok is not None
-            and e5_model is not None
-            and e5_device is not None
-            and lof_model_txt is not None
-            and train_raw_scores_txt is not None
-        ):
+        # Plausibility (LOF in embedding space)
+        lof_txt = ctx.get("lof_model_txt")
+        scores_txt = ctx.get("train_raw_scores_txt")
+        if _embed_fn is not None and lof_txt is not None and scores_txt is not None:
             plaus_txt = cache_bucket.get("plaus_txt") if cache_bucket is not None else None
             if plaus_txt is None:
-                plaus_txt = text_plausibility_lof(
-                    text_candidate=text_candidate,
-                    lof_model_txt=lof_model_txt,
-                    train_raw_scores_txt=train_raw_scores_txt,
-                    tokenizer=tok,
-                    model=e5_model,
-                    device=e5_device,
+                plaus_txt = float(text_plausibility_lof(
+                    text_candidate=cand,
+                    lof_model_txt=lof_txt,
+                    train_raw_scores_txt=scores_txt,
+                    embed_fn=_embed_fn,
+                    embedding_cache=embedding_cache,
+                ))
+                if cache_bucket is not None:
+                    cache_bucket["plaus_txt"] = plaus_txt
+            plaus_parts.append((w, plaus_txt))
+
+    # ---------------------------------------------------------------- image
+    for name, spec in image_modalities.items():
+        fact = spec["factual"]
+        cand = spec["candidate"]
+        ctx = spec.get("context") or {}
+        w = weights[name]
+
+        embed_fn = ctx.get("embed_fn")
+        if embed_fn is None:
+            # embed_fn is required for all image objectives — skip this modality.
+            continue
+
+        img_key = f"__img__{name}"
+        img_cache_bucket = (
+            text_metrics_cache.setdefault(img_key, {})
+            if text_metrics_cache is not None else {}
+        )
+
+        # Proximity (cosine distance in embedding space)
+        prox_img = img_cache_bucket.get("prox_img")
+        if prox_img is None:
+            prox_img = image_proximity_embedding(
+                fact, cand, embed_fn=embed_fn, embedding_cache=embedding_cache
+            )
+            img_cache_bucket["prox_img"] = prox_img
+        prox_parts.append((w, float(prox_img)))
+
+        # Sparsity (L1 distance in embedding space, normalised by dim)
+        sparse_img = img_cache_bucket.get("sparse_img")
+        if sparse_img is None:
+            sparse_img = image_sparsity_embedding(
+                fact, cand, embed_fn=embed_fn, embedding_cache=embedding_cache
+            )
+            img_cache_bucket["sparse_img"] = sparse_img
+        sparse_parts.append((w, float(sparse_img)))
+
+        # Plausibility (LOF percentile rank, target-class fitted)
+        lof_img = ctx.get("lof_model_img")
+        scores_img = ctx.get("train_raw_scores_img")
+        if lof_img is not None and scores_img is not None:
+            plaus_img = img_cache_bucket.get("plaus_img")
+            if plaus_img is None:
+                plaus_img = image_plausibility_lof(
+                    cand,
+                    lof_model_img=lof_img,
+                    train_raw_scores_img=scores_img,
+                    embed_fn=embed_fn,
                     embedding_cache=embedding_cache,
                 )
-                if cache_bucket is not None:
-                    cache_bucket["plaus_txt"] = float(plaus_txt)
-            if plaus_merge == "weighted_sum":
-                obj_plaus = (w_base_plaus * float(obj_plaus)) + (w_text_plaus * float(plaus_txt))
-            else:
-                denom = max(1e-8, w_base_plaus + w_text_plaus)
-                obj_plaus = ((w_base_plaus * float(obj_plaus)) + (w_text_plaus * float(plaus_txt))) / denom
+                img_cache_bucket["plaus_img"] = plaus_img
+            plaus_parts.append((w, float(plaus_img)))
+
+    # ---------------------------------------------------------------- aggregate
+    obj_prox = float(sum(w * v for w, v in prox_parts)) if prox_parts else float("nan")
+    obj_sparse = float(sum(w * v for w, v in sparse_parts)) if sparse_parts else float("nan")
+    obj_plaus = float(sum(w * v for w, v in plaus_parts)) if plaus_parts else float("nan")
 
     return np.array([obj_outcome, obj_prox, obj_sparse, obj_plaus], dtype=float)
 
