@@ -398,16 +398,30 @@ def _evaluate_combo_objectives(
             for cand in (candidates or []):
                 x_tab_cand = cand.get("static")
                 text_cand = cand.get("text") or cand.get("text_input")
+                # Support per-candidate multi-field text objectives via _text_modalities_fn.
+                # When present, it returns {"text_modalities": {...}} keyed by field name,
+                # replacing the single flat text_candidate/text_factual args.
+                _tmf = objectives_kwargs.get("_text_modalities_fn")
+                if _tmf is not None:
+                    extra_text_kw = _tmf(sample_idx, cand, text_factual)
+                else:
+                    extra_text_kw = {
+                        "text_candidate": text_cand if text_cand is not None else text_factual,
+                        "text_factual": text_factual,
+                    }
+                # Strip private/internal keys (those starting with "_") before forwarding
+                # to compute_objectives, which does not accept arbitrary kwargs.
+                clean_kw = {k: v for k, v in objectives_kwargs.items()
+                            if not k.startswith("_")}
                 try:
                     objs = compute_objectives(
                         x_tab=x_tab_cand,
                         x_tab_ref=x_tab_ref,
                         X_tab_obs=X_train_static,
-                        text_candidate=text_cand if text_cand is not None else text_factual,
-                        text_factual=text_factual,
                         embedding_cache=embedding_cache,
                         text_metrics_cache=text_metrics_cache,
-                        **objectives_kwargs,
+                        **extra_text_kw,
+                        **clean_kw,
                     )
                     accum[gen_name]["outcome"].append(float(objs[0]))
                     accum[gen_name]["proximity"].append(float(objs[1]))
