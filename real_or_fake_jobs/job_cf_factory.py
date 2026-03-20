@@ -55,7 +55,7 @@ def build_job_dataset(
     -------
     dict with keys:
         "dataset"                  : MultimodalDataset
-                                     X_train_text = X_train_description (primary)
+                                     primary text branch = "description"
         "model"                    : None
         "text_backend_kwargs"      : dict with bert_tokenizer / bert_model / bert_device
         "label_classes"            : list of class name strings
@@ -88,8 +88,17 @@ def build_job_dataset(
         X_train_static = data["X_train_static"].astype(float),
         y_train        = data["y_train"],
         X_test_static  = data["X_test_static"].astype(float),
-        X_train_text   = X_train_description,
-        X_test_text    = X_test_description,
+        X_train_texts  = {
+            "description": X_train_description,
+            "company_profile": X_train_company_profile,
+            "requirements": X_train_requirements,
+        },
+        X_test_texts   = {
+            "description": X_test_description,
+            "company_profile": X_test_company_profile,
+            "requirements": X_test_requirements,
+        },
+        primary_text_name = "description",
         y_test         = data["y_test"],
     )
 

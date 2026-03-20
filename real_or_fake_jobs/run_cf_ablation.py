@@ -70,7 +70,7 @@ from run_distance_ablation import run_distance_ablation  # from examples/
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN, TextNN
-from counterfactual_helpers import find_k_closest_latent_model, find_k_closest_static
+from counterfactual_helpers import find_k_closest_latent, find_k_closest_static
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -274,9 +274,13 @@ for enc_name, _ in _encoder_embed_fns:
 
 # Expose description precomputed embeddings to the base TextNN via text_bk
 text_bk["precomputed_text_embeddings_by_encoder"] = {
-    enc_name: _precomputed_by_field["description"][enc_name]
-    for enc_name, _ in _encoder_embed_fns
+    fname: {
+        enc_name: _precomputed_by_field[fname][enc_name]
+        for enc_name, _ in _encoder_embed_fns
+    }
+    for fname in _FIELD_NAMES
 }
+text_bk["auto_text_branch_generators"] = False
 
 # ---------------------------------------------------------------------------
 # FieldTextNN — TextNN on a specific field; output "text" is always description
@@ -307,15 +311,34 @@ class FieldTextNN(CounterfactualGenerator):
         self._train_desc  = np.asarray(X_train_desc, dtype=object).reshape(-1)
 
     def generate(self, dataset, sample_idx, model=None, target_value=0, k=None):
-        alt        = _dc_replace(dataset, X_train_text=self._X_train, X_test_text=self._X_test)
-        candidates = self._inner.generate(alt, sample_idx, target_value=target_value, k=k)
+        candidates = self._inner.generate(dataset, sample_idx, target_value=target_value, k=k)
         # Replace "text" / "text_input" with description for consistent objectives
         for cand in candidates:
             src = cand.get("source_train_idx")
             if src is not None:
                 cand["text"]       = str(self._train_desc[src])
                 cand["text_input"] = self._train_desc[src]
+                cand.setdefault("texts", {})["description"] = str(self._train_desc[src])
+                cand.setdefault("text_inputs", {})["description"] = self._train_desc[src]
         return candidates
+
+    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None):
+        batch = self._inner.generate_batch(
+            dataset,
+            sample_indices,
+            model=model,
+            target_value=target_value,
+            k=k,
+        )
+        for candidates in batch.values():
+            for cand in candidates:
+                src = cand.get("source_train_idx")
+                if src is not None:
+                    cand["text"] = str(self._train_desc[src])
+                    cand["text_input"] = self._train_desc[src]
+                    cand.setdefault("texts", {})["description"] = str(self._train_desc[src])
+                    cand.setdefault("text_inputs", {})["description"] = self._train_desc[src]
+        return batch
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +368,45 @@ def _run_embedding_nn_search(
     top_train_idx = candidate_idx[order]
     top_dists     = dists_row[order]
     return {sample_idx: top_train_idx}, {sample_idx: top_dists}
+
+
+def _run_embedding_nn_search_batch(
+    sample_indices,
+    emb_train:    np.ndarray,
+    emb_test:     np.ndarray,
+    y_train:      np.ndarray,
+    target_value: int,
+    k_search:     int,
+    metric:       str = "cosine",
+):
+    """Find k_search nearest neighbours in a pre-computed embedding space."""
+    selected = np.asarray([int(idx) for idx in sample_indices], dtype=int)
+    candidate_idx = np.flatnonzero(np.asarray(y_train) == target_value)
+    if candidate_idx.size == 0:
+        empty_idx = np.empty((0,), dtype=int)
+        empty_dist = np.empty((0,), dtype=float)
+        return (
+            {int(idx): empty_idx for idx in selected},
+            {int(idx): empty_dist for idx in selected},
+        )
+
+    queries = emb_test[selected]
+    cands = emb_train[candidate_idx]
+    dist_matrix = pairwise_distances(queries, cands, metric=metric)
+    k_eff = min(k_search, len(candidate_idx))
+
+    idx_dict = {}
+    dist_dict = {}
+    for r, sample_idx in enumerate(selected):
+        dists_row = dist_matrix[r]
+        if k_eff == len(candidate_idx):
+            order = np.argsort(dists_row)[:k_eff]
+        else:
+            part = np.argpartition(dists_row, k_eff - 1)[:k_eff]
+            order = part[np.argsort(dists_row[part])]
+        idx_dict[int(sample_idx)] = candidate_idx[order]
+        dist_dict[int(sample_idx)] = dists_row[order]
+    return idx_dict, dist_dict
 
 
 # ---------------------------------------------------------------------------
@@ -392,86 +454,97 @@ class MultiFieldFrankensteinNN(CounterfactualGenerator):
         self._vec_metric    = vec_metric
 
     def generate(self, dataset, sample_idx, model=None, target_value=0, k=None):
+        return self.generate_batch(
+            dataset,
+            [sample_idx],
+            model=model,
+            target_value=target_value,
+            k=k,
+        ).get(int(sample_idx), [])
+
+    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None):
         k = k if k is not None else self.k
+        selected = [int(idx) for idx in sample_indices]
 
         # --- tabular branch (static features) ---
         idx_tab, _ = find_k_closest_static(
             X_train_static        = dataset.X_train_static,
             y_train               = dataset.y_train,
             X_test_static         = dataset.X_test_static,
-            selected_test_indices = [sample_idx],
+            selected_test_indices = selected,
             target_value          = target_value,
             k                     = self.k_search,
             distance_fn           = self.static_dist_fn,
             return_indices        = True,
         )
-        tab_idxs = np.asarray(idx_tab.get(int(sample_idx), []), dtype=int)
 
         # --- 3 independent text-field branches ---
-        desc_idx_d, _  = _run_embedding_nn_search(
-            sample_idx, self._pre_desc["train"],    self._pre_desc["test"],
+        desc_idx_d, _  = _run_embedding_nn_search_batch(
+            selected, self._pre_desc["train"],    self._pre_desc["test"],
             self._y_train, target_value, self.k_search, self._vec_metric,
         )
-        prof_idx_d, _  = _run_embedding_nn_search(
-            sample_idx, self._pre_profile["train"], self._pre_profile["test"],
+        prof_idx_d, _  = _run_embedding_nn_search_batch(
+            selected, self._pre_profile["train"], self._pre_profile["test"],
             self._y_train, target_value, self.k_search, self._vec_metric,
         )
-        reqs_idx_d, _  = _run_embedding_nn_search(
-            sample_idx, self._pre_reqs["train"],    self._pre_reqs["test"],
+        reqs_idx_d, _  = _run_embedding_nn_search_batch(
+            selected, self._pre_reqs["train"],    self._pre_reqs["test"],
             self._y_train, target_value, self.k_search, self._vec_metric,
         )
-
-        desc_idxs    = np.asarray(desc_idx_d.get(int(sample_idx), []), dtype=int)
-        profile_idxs = np.asarray(prof_idx_d.get(int(sample_idx), []), dtype=int)
-        reqs_idxs    = np.asarray(reqs_idx_d.get(int(sample_idx), []), dtype=int)
 
         X_static  = np.asarray(dataset.X_train_static,    dtype=float)
         X_desc    = np.asarray(X_train_description,        dtype=object).reshape(-1)
         X_profile = np.asarray(X_train_company_profile,    dtype=object).reshape(-1)
         X_reqs    = np.asarray(X_train_requirements,       dtype=object).reshape(-1)
 
-        k_eff = min(k, len(tab_idxs), len(desc_idxs), len(profile_idxs), len(reqs_idxs))
+        batch_results = {}
+        for sample_idx in selected:
+            tab_idxs = np.asarray(idx_tab.get(int(sample_idx), []), dtype=int)
+            desc_idxs = np.asarray(desc_idx_d.get(int(sample_idx), []), dtype=int)
+            profile_idxs = np.asarray(prof_idx_d.get(int(sample_idx), []), dtype=int)
+            reqs_idxs = np.asarray(reqs_idx_d.get(int(sample_idx), []), dtype=int)
 
-        results = []
-        for i in range(1, k_eff + 1):
-            use_n    = i
-            tab_sub  = tab_idxs[:use_n]
-            static_med = (
-                X_static[tab_sub[0]].copy()
-                if use_n == 1
-                else np.median(X_static[tab_sub], axis=0)
-            ).astype(float)
+            k_eff = min(k, len(tab_idxs), len(desc_idxs), len(profile_idxs), len(reqs_idxs))
+            results = []
+            for i in range(1, k_eff + 1):
+                use_n = i
+                tab_sub = tab_idxs[:use_n]
+                static_med = (
+                    X_static[tab_sub[0]].copy()
+                    if use_n == 1
+                    else np.median(X_static[tab_sub], axis=0)
+                ).astype(float)
 
-            desc_anc    = int(desc_idxs[i - 1])
-            profile_anc = int(profile_idxs[i - 1])
-            reqs_anc    = int(reqs_idxs[i - 1])
+                desc_anc = int(desc_idxs[i - 1])
+                profile_anc = int(profile_idxs[i - 1])
+                reqs_anc = int(reqs_idxs[i - 1])
 
-            desc_str    = str(X_desc[desc_anc])
-            profile_str = str(X_profile[profile_anc])
-            reqs_str    = str(X_reqs[reqs_anc])
+                desc_str = str(X_desc[desc_anc])
+                profile_str = str(X_profile[profile_anc])
+                reqs_str = str(X_reqs[reqs_anc])
 
-            results.append({
-                "static":      static_med,
-                "ts":          {},
-                "tab":         {},
-                "text":        desc_str,   # description for text-proximity objectives
-                "text_input":  desc_str,   # predict_fn receives this (approx for chimeric)
-                "image":       None,
-                "image_input": None,
-                "source_train_idx": desc_anc,
-                "source_indices": {
-                    "static":       int(tab_idxs[i - 1]),
-                    "text_desc":    desc_anc,
-                    "text_profile": profile_anc,
-                    "text_reqs":    reqs_anc,
-                },
-                "n_neighbors_used": use_n,
-                "distance_metric":  f"chimeric/{self._vec_metric}",
-                # All 3 text fields stored explicitly for multi-field objectives/predict_fn
-                "company_profile": profile_str,
-                "requirements":    reqs_str,
-            })
-        return results
+                results.append({
+                    "static":      static_med,
+                    "ts":          {},
+                    "tab":         {},
+                    "text":        desc_str,
+                    "text_input":  desc_str,
+                    "image":       None,
+                    "image_input": None,
+                    "source_train_idx": desc_anc,
+                    "source_indices": {
+                        "static":       int(tab_idxs[i - 1]),
+                        "text_desc":    desc_anc,
+                        "text_profile": profile_anc,
+                        "text_reqs":    reqs_anc,
+                    },
+                    "n_neighbors_used": use_n,
+                    "distance_metric":  f"chimeric/{self._vec_metric}",
+                    "company_profile": profile_str,
+                    "requirements":    reqs_str,
+                })
+            batch_results[int(sample_idx)] = results
+        return batch_results
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +582,18 @@ class MultiFieldCombinedNN(CombinedNN):
         self._vec_metric  = vec_metric
 
     def generate(self, dataset, sample_idx, model=None, target_value=0, k=None, precomputed=None):
+        return self.generate_batch(
+            dataset,
+            [sample_idx],
+            model=model,
+            target_value=target_value,
+            k=k,
+            precomputed=precomputed,
+        ).get(int(sample_idx), [])
+
+    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None, precomputed=None):
         k  = k if k is not None else self.k
+        selected = [int(idx) for idx in sample_indices]
         pc = dict(precomputed or {})
         avail = dataset.available_modalities
 
@@ -524,7 +608,7 @@ class MultiFieldCombinedNN(CombinedNN):
                     X_train_static        = dataset.X_train_static,
                     y_train               = dataset.y_train,
                     X_test_static         = dataset.X_test_static,
-                    selected_test_indices = [sample_idx],
+                    selected_test_indices = selected,
                     target_value          = target_value,
                     k                     = self.k_search,
                     distance_fn           = self.static_dist_fn,
@@ -538,26 +622,27 @@ class MultiFieldCombinedNN(CombinedNN):
             ("text_profile", self._pre_profile),
             ("text_reqs",    self._pre_reqs),
         ]:
-            idx_d, dist_d = _run_embedding_nn_search(
-                sample_idx, pre["train"], pre["test"],
+            idx_d, dist_d = _run_embedding_nn_search_batch(
+                selected, pre["train"], pre["test"],
                 self._y_train, target_value, self.k_search, self._vec_metric,
             )
             active_idx_dist[fname] = (idx_d, dist_d)
 
         if not active_idx_dist:
-            return []
+            return {int(idx): [] for idx in selected}
 
-        results = self._combined_partial(active_idx_dist, sample_idx, k, dataset)
-        # Annotate each candidate with the consistent profile/reqs from the
-        # same training sample that was selected by the intersection.
         X_profile = np.asarray(X_train_company_profile, dtype=object).reshape(-1)
         X_reqs    = np.asarray(X_train_requirements,    dtype=object).reshape(-1)
-        for cand in results:
-            anchor = cand.get("source_train_idx")
-            if anchor is not None:
-                cand["company_profile"] = str(X_profile[anchor])
-                cand["requirements"]    = str(X_reqs[anchor])
-        return results
+        batch_results = {}
+        for sample_idx in selected:
+            results = self._combined_partial(active_idx_dist, sample_idx, k, dataset)
+            for cand in results:
+                anchor = cand.get("source_train_idx")
+                if anchor is not None:
+                    cand["company_profile"] = str(X_profile[anchor])
+                    cand["requirements"]    = str(X_reqs[anchor])
+            batch_results[int(sample_idx)] = results
+        return batch_results
 
 
 # ---------------------------------------------------------------------------
@@ -574,26 +659,34 @@ class PyTorchLatentNN(CounterfactualGenerator):
         self.distance_metric = distance_metric
 
     def generate(self, dataset, sample_idx, model=None, target_value=0, k=None):
+        return self.generate_batch(
+            dataset,
+            [sample_idx],
+            model=model,
+            target_value=target_value,
+            k=k,
+        ).get(int(sample_idx), [])
+
+    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None):
         k = k if k is not None else self.k
-        _, _, indices = find_k_closest_latent_model(
-            X_train=dataset.X_train_static,
+        indices, _ = find_k_closest_latent(
+            X_train_latent=self.train_latents,
             y_train=dataset.y_train,
-            X_test=dataset.X_test_static,
-            selected_test_indices=[sample_idx],
-            model=None,
+            X_test_latent=self.test_latents,
+            selected_test_indices=[int(idx) for idx in sample_indices],
             target_value=target_value,
             k=k,
             distance_metric=self.distance_metric,
-            precomputed_train_latent=self.train_latents,
-            precomputed_test_latent=self.test_latents,
-            return_indices=True,
         )
-        return TabularNN._materialize(
-            indices,
-            sample_idx,
-            dataset,
-            distance_metric_label=self.distance_metric or "euclidean",
-        )
+        return {
+            int(idx): TabularNN._materialize(
+                indices,
+                int(idx),
+                dataset,
+                distance_metric_label=self.distance_metric or "euclidean",
+            )
+            for idx in sample_indices
+        }
 
 
 def _compute_torch_latents(torch_model, tokenizer, device, batch_size=16):
@@ -902,7 +995,8 @@ def _multimodal_generators_factory(
 ):
     encoder    = (text_cfg or {}).get("encoder", "raw")
     metric     = (text_cfg or {}).get("metric", "cosine")
-    tab_metric = (tab_cfg  or {}).get("__primary__", "euclidean")
+    primary_tab = dataset.primary_tabular_name
+    tab_metric = (tab_cfg  or {}).get(primary_tab, "euclidean")
 
     static_dist = _metric_to_static_dist_fn(tab_metric)
 
@@ -923,6 +1017,7 @@ def _multimodal_generators_factory(
     for fname, ftrain, ftest in zip(_FIELD_NAMES, _FIELD_TRAINS, _FIELD_TESTS):
         pre = _get_field_precomputed(fname, encoder)
         inner = TextNN(
+            text_name                          = fname,
             k                                  = args.k,
             text_encoder                       = encoder,
             text_distance_metric               = metric,

@@ -68,12 +68,16 @@ def build_tweet_dataset(
     data          = np.load(root / "dataset.npz", allow_pickle=True)
     label_classes = data["label_classes"].tolist()
 
+    x_train_text = data["X_train_text"]
+    x_test_text = data["X_test_text"]
+
     dataset = MultimodalDataset(
         X_train_static = data["X_train_static"].astype(float),
         y_train        = data["y_train"],
         X_test_static  = data["X_test_static"].astype(float),
-        X_train_text   = data["X_train_text"],
-        X_test_text    = data["X_test_text"],
+        X_train_texts  = {"tweet": x_train_text},
+        X_test_texts   = {"tweet": x_test_text},
+        primary_text_name = "tweet",
         y_test         = data["y_test"],
     )
 

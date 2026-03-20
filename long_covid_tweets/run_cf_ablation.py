@@ -54,7 +54,7 @@ from run_distance_ablation import run_distance_ablation  # from examples/
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import FrankensteinNN, CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN
-from counterfactual_helpers import find_k_closest_latent_model
+from counterfactual_helpers import find_k_closest_latent
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -182,18 +182,14 @@ class PyTorchLatentNN(CounterfactualGenerator):
 
     def generate(self, dataset, sample_idx, model=None, target_value=0, k=None):
         k = k if k is not None else self.k
-        _, _, indices = find_k_closest_latent_model(
-            X_train=dataset.X_train_static,
+        indices, _ = find_k_closest_latent(
+            X_train_latent=self.train_latents,
             y_train=dataset.y_train,
-            X_test=dataset.X_test_static,
+            X_test_latent=self.test_latents,
             selected_test_indices=[sample_idx],
-            model=None,
             target_value=target_value,
             k=k,
             distance_metric=self.distance_metric,
-            precomputed_train_latent=self.train_latents,
-            precomputed_test_latent=self.test_latents,
-            return_indices=True,
         )
         return TabularNN._materialize(
             indices,
@@ -538,7 +534,8 @@ def _multimodal_generators_factory(
 ):
     """Build Frankenstein, Combined, and EarlyFusion generators for this combo."""
     encoder       = (text_cfg or {}).get("encoder", "raw")
-    tab_metric    = (tab_cfg  or {}).get("__primary__", "euclidean")
+    primary_tab   = dataset.primary_tabular_name
+    tab_metric    = (tab_cfg  or {}).get(primary_tab, "euclidean")
     embed_fn      = _get_embed_fn_for_encoder(encoder)
     precomputed_text = _get_precomputed_embeddings_for_encoder(encoder)
     static_dist   = _metric_to_static_dist_fn(tab_metric)
