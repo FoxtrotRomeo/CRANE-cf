@@ -38,6 +38,8 @@ class ImageNN(CounterfactualGenerator):
 
     Parameters
     ----------
+    image_name           : key in ``dataset.X_train_images`` / ``dataset.X_test_images``,
+                           or ``None`` to use the resolved primary / sole image branch.
     k                    : default number of candidates
     image_encoder        : backbone identifier (see above)
     image_distance_metric: vector metric — ``"cosine"`` (default),
@@ -54,6 +56,7 @@ class ImageNN(CounterfactualGenerator):
 
     def __init__(
         self,
+        image_name: Optional[str] = None,
         k: int = 20,
         image_encoder: str = "precomputed",
         image_distance_metric: str = "cosine",
@@ -62,6 +65,7 @@ class ImageNN(CounterfactualGenerator):
         device: Optional[str] = None,
         batch_size: int = 32,
     ):
+        self.image_name = image_name
         self.k = k
         self.image_encoder = image_encoder
         self.image_distance_metric = image_distance_metric
@@ -76,6 +80,8 @@ class ImageNN(CounterfactualGenerator):
         indices_dict: dict,
         sample_idx: int,
         dataset,
+        train_img,
+        image_name: str,
         distance_metric_label: str,
         image_encoder_label: str,
     ) -> List[Dict[str, Any]]:
@@ -102,9 +108,6 @@ class ImageNN(CounterfactualGenerator):
             name: np.asarray(arr, dtype=float)
             for name, arr in (dataset.X_train_tab or {}).items()
         }
-        # Images are kept as-is (may be PIL or ndarray) for rank-matched retrieval.
-        train_img = dataset.X_train_img
-
         results = []
         for i in range(1, n_avail + 1):
             use_n = min(2 * i - 1, n_avail)
@@ -134,6 +137,9 @@ class ImageNN(CounterfactualGenerator):
                     "tab": tab_meds,
                     "image": img_val,
                     "image_input": img_val,
+                    "images": {image_name: img_val},
+                    "image_inputs": {image_name: img_val},
+                    "image_branch": image_name,
                     "source_train_idx": anchor,
                     "n_neighbors_used": int(use_n),
                     "distance_metric": distance_metric_label,
@@ -171,16 +177,19 @@ class ImageNN(CounterfactualGenerator):
 
         Returns ``(candidates, indices_dict, distances_dict)``.
         """
-        if dataset.X_train_img is None or dataset.X_test_img is None:
+        image_name = dataset.resolve_image_branch_name(self.image_name)
+        train_img = dataset.get_image_branch(image_name, split="train")
+        test_img = dataset.get_image_branch(image_name, split="test")
+        if train_img is None or test_img is None:
             print("[ImageNN] image modality not present in dataset — returning empty candidates.")
             return [], {}, {}
 
         k = k if k is not None else self.k
 
         indices_dict, distances_dict = find_k_closest_image(
-            X_train_img=dataset.X_train_img,
+            X_train_img=train_img,
             y_train=dataset.y_train,
-            X_test_img=dataset.X_test_img,
+            X_test_img=test_img,
             selected_test_indices=[sample_idx],
             target_value=target_value,
             k=k,
@@ -196,10 +205,63 @@ class ImageNN(CounterfactualGenerator):
             indices_dict,
             sample_idx,
             dataset,
+            train_img,
+            image_name,
             distance_metric_label=self._resolve_distance_metric_label(),
             image_encoder_label=self._resolve_encoder_label(),
         )
         return candidates, indices_dict, distances_dict
+
+    def generate_raw_batch(
+        self,
+        dataset,
+        sample_indices,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ):
+        """Run the image NN search once for many samples.
+
+        Returns ``(candidates_by_sample, indices_dict, distances_dict)``.
+        """
+        image_name = dataset.resolve_image_branch_name(self.image_name)
+        train_img = dataset.get_image_branch(image_name, split="train")
+        test_img = dataset.get_image_branch(image_name, split="test")
+        selected = [int(idx) for idx in sample_indices]
+        if train_img is None or test_img is None:
+            print("[ImageNN] image modality not present in dataset — returning empty candidates.")
+            empty = {int(idx): [] for idx in selected}
+            return empty, {}, {}
+
+        k = k if k is not None else self.k
+
+        indices_dict, distances_dict = find_k_closest_image(
+            X_train_img=train_img,
+            y_train=dataset.y_train,
+            X_test_img=test_img,
+            selected_test_indices=selected,
+            target_value=target_value,
+            k=k,
+            image_encoder=self.image_encoder,
+            image_distance_metric=self.image_distance_metric,
+            image_distance_fn=self.image_distance_fn,
+            embed_fn=self.embed_fn,
+            device=self.device,
+            batch_size=self.batch_size,
+        )
+
+        candidates_by_sample = {
+            int(idx): self._materialize(
+                indices_dict,
+                int(idx),
+                dataset,
+                train_img,
+                image_name,
+                distance_metric_label=self._resolve_distance_metric_label(),
+                image_encoder_label=self._resolve_encoder_label(),
+            )
+            for idx in selected
+        }
+        return candidates_by_sample, indices_dict, distances_dict
 
     # ------------------------------------------------------------------
     def generate(
@@ -214,3 +276,19 @@ class ImageNN(CounterfactualGenerator):
             dataset, sample_idx, target_value=target_value, k=k
         )
         return candidates
+
+    def generate_batch(
+        self,
+        dataset,
+        sample_indices,
+        model=None,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        candidates_by_sample, _, _ = self.generate_raw_batch(
+            dataset,
+            sample_indices,
+            target_value=target_value,
+            k=k,
+        )
+        return candidates_by_sample

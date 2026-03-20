@@ -18,10 +18,9 @@ class TabularNN(CounterfactualGenerator):
     """Nearest-neighbour counterfactuals in a tabular feature space.
 
     When ``tab_name`` is ``None`` (default) the search is performed on the
-    primary ``dataset.X_train_static`` array, identical to the original
-    behaviour.  When ``tab_name`` is a string, the search is performed on
-    ``dataset.X_train_tab[tab_name]`` instead — this is the mechanism for
-    supporting an arbitrary number of named tabular modalities.
+    resolved primary tabular branch when one exists, or on the only available
+    tabular branch. When multiple tabular branches are present and no primary
+    is resolved, callers must pass ``tab_name`` explicitly.
 
     Finds the k training samples closest to the query sample in the configured
     distance metric space, filtered to ``target_value`` class. Progressive-median
@@ -33,7 +32,7 @@ class TabularNN(CounterfactualGenerator):
     Parameters
     ----------
     tab_name     : key in ``dataset.X_train_tab`` / ``dataset.X_test_tab``,
-                   or ``None`` to use the primary ``X_train_static``.
+                   or ``None`` to use the resolved primary / sole tabular branch.
     k            : default number of candidates
     distance_fn  : optional pairwise distance callable
     distance_metric : optional metric string (e.g., "euclidean", "manhattan", "hamming");
@@ -136,23 +135,12 @@ class TabularNN(CounterfactualGenerator):
     ):
         """Run the NN search and return ``(candidates, indices_dict, distances_dict)``."""
         k = k if k is not None else self.k
-
-        if self.tab_name is None:
-            # Primary tabular: search on X_train_static (original behaviour).
-            X_train_arr = dataset.X_train_static
-            X_test_arr = dataset.X_test_static
-        else:
-            # Named tabular: search on X_train_tab[tab_name].
-            X_train_tab = dataset.X_train_tab or {}
-            X_test_tab = dataset.X_test_tab or {}
-            if self.tab_name not in X_train_tab or self.tab_name not in X_test_tab:
-                print(
-                    f"[TabularNN:{self.tab_name!r}] tab_name not found in dataset "
-                    "— returning empty candidates."
-                )
-                return [], {}, {}
-            X_train_arr = X_train_tab[self.tab_name]
-            X_test_arr = X_test_tab[self.tab_name]
+        branch_name = dataset.resolve_tabular_branch_name(self.tab_name)
+        if branch_name is None:
+            print("[TabularNN] tabular modality not present in dataset — returning empty candidates.")
+            return [], {}, {}
+        X_train_arr = dataset.get_tabular_branch(branch_name, split="train")
+        X_test_arr = dataset.get_tabular_branch(branch_name, split="test")
 
         indices, distances = find_k_closest_static(
             X_train_static=X_train_arr,
@@ -173,6 +161,49 @@ class TabularNN(CounterfactualGenerator):
         )
         return candidates, indices, distances
 
+    def generate_raw_batch(
+        self,
+        dataset,
+        sample_indices,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ):
+        """Run the NN search once for many samples.
+
+        Returns ``(candidates_by_sample, indices_dict, distances_dict)``.
+        """
+        k = k if k is not None else self.k
+        selected = [int(idx) for idx in sample_indices]
+        branch_name = dataset.resolve_tabular_branch_name(self.tab_name)
+        if branch_name is None:
+            print("[TabularNN] tabular modality not present in dataset — returning empty candidates.")
+            empty = {int(idx): [] for idx in selected}
+            return empty, {}, {}
+        X_train_arr = dataset.get_tabular_branch(branch_name, split="train")
+        X_test_arr = dataset.get_tabular_branch(branch_name, split="test")
+
+        indices, distances = find_k_closest_static(
+            X_train_static=X_train_arr,
+            y_train=dataset.y_train,
+            X_test_static=X_test_arr,
+            selected_test_indices=selected,
+            target_value=target_value,
+            k=k,
+            distance_fn=self.distance_fn,
+            distance_metric=self.distance_metric,
+            return_indices=True,
+        )
+        candidates_by_sample = {
+            int(idx): self._materialize(
+                indices,
+                int(idx),
+                dataset,
+                distance_metric_label=self._resolve_distance_metric_label(),
+            )
+            for idx in selected
+        }
+        return candidates_by_sample, indices, distances
+
     def generate(
         self,
         dataset,
@@ -183,3 +214,19 @@ class TabularNN(CounterfactualGenerator):
     ) -> List[Dict[str, Any]]:
         candidates, _, _ = self.generate_raw(dataset, sample_idx, target_value=target_value, k=k)
         return candidates
+
+    def generate_batch(
+        self,
+        dataset,
+        sample_indices,
+        model=None,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        candidates_by_sample, _, _ = self.generate_raw_batch(
+            dataset,
+            sample_indices,
+            target_value=target_value,
+            k=k,
+        )
+        return candidates_by_sample

@@ -27,6 +27,8 @@ class TextNN(CounterfactualGenerator):
 
     Parameters
     ----------
+    text_name           : key in ``dataset.X_train_texts`` / ``dataset.X_test_texts``,
+                          or ``None`` to use the resolved primary / sole text branch.
     k                   : default number of candidates
     text_encoder        : "e5" (default), "bert", "tfidf", "word2vec", "custom", "raw"
     text_distance_metric: vector metric ("cosine", "euclidean", ...) or direct text
@@ -52,6 +54,7 @@ class TextNN(CounterfactualGenerator):
 
     def __init__(
         self,
+        text_name: Optional[str] = None,
         k: int = 20,
         text_encoder: str = "e5",
         text_distance_metric: str = "cosine",
@@ -76,6 +79,7 @@ class TextNN(CounterfactualGenerator):
         text_metric_kwargs: Optional[Dict[str, Any]] = None,
         text_repr_fn: Optional[Callable] = None,
     ):
+        self.text_name = text_name
         self.k = k
         self.text_encoder = text_encoder
         self.text_distance_metric = text_distance_metric
@@ -114,6 +118,7 @@ class TextNN(CounterfactualGenerator):
         sample_idx: int,
         dataset,
         train_text_raw,
+        text_name: str,
         distance_metric_label: str,
         text_encoder_label: str,
     ) -> List[Dict[str, Any]]:
@@ -167,6 +172,9 @@ class TextNN(CounterfactualGenerator):
                     "tab": tab_meds,
                     "text": str(train_text_np[anchor]),
                     "text_input": train_text_np[anchor],
+                    "texts": {text_name: str(train_text_np[anchor])},
+                    "text_inputs": {text_name: train_text_np[anchor]},
+                    "text_branch": text_name,
                     "source_train_idx": anchor,
                     "n_neighbors_used": int(use_n),
                     "distance_metric": distance_metric_label,
@@ -201,13 +209,16 @@ class TextNN(CounterfactualGenerator):
 
         Returns ``(candidates, indices_dict, distances_dict, train_text_str)``.
         """
-        if dataset.X_train_text is None or dataset.X_test_text is None:
+        text_name = dataset.resolve_text_branch_name(self.text_name)
+        train_text_raw = dataset.get_text_branch(text_name, split="train")
+        test_text_raw = dataset.get_text_branch(text_name, split="test")
+        if train_text_raw is None or test_text_raw is None:
             print("[TextNN] text modality not present in dataset — returning empty candidates.")
             return [], {}, {}, []
 
         k = k if k is not None else self.k
-        train_text_str = self._to_str_list(dataset.X_train_text)
-        test_text_str = self._to_str_list(dataset.X_test_text)
+        train_text_str = self._to_str_list(train_text_raw)
+        test_text_str = self._to_str_list(test_text_raw)
 
         # find_k_closest_text expects meds/labs arrays for candidate construction;
         # TextNN materializes candidates itself, so placeholders are fine when absent.
@@ -255,8 +266,8 @@ class TextNN(CounterfactualGenerator):
             tfidf_kwargs=self.tfidf_kwargs,
             word2vec_embed_fn=self.word2vec_embed_fn,
             word2vec_model=self.word2vec_model,
-            train_text_raw=dataset.X_train_text,
-            test_text_raw=dataset.X_test_text,
+            train_text_raw=train_text_raw,
+            test_text_raw=test_text_raw,
             precomputed_train_embeddings=self.precomputed_train_text_embeddings,
             precomputed_test_embeddings=self.precomputed_test_text_embeddings,
         )
@@ -265,11 +276,97 @@ class TextNN(CounterfactualGenerator):
             indices_dict,
             sample_idx,
             dataset,
-            dataset.X_train_text,
+            train_text_raw,
+            text_name,
             distance_metric_label=self._resolve_distance_metric_label(),
             text_encoder_label=self._resolve_text_encoder_label(),
         )
         return candidates, indices_dict, distances_dict, train_text_str
+
+    def generate_raw_batch(
+        self,
+        dataset,
+        sample_indices,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ):
+        """Run the text NN search once for many samples.
+
+        Returns ``(candidates_by_sample, indices_dict, distances_dict, train_text_str)``.
+        """
+        text_name = dataset.resolve_text_branch_name(self.text_name)
+        train_text_raw = dataset.get_text_branch(text_name, split="train")
+        test_text_raw = dataset.get_text_branch(text_name, split="test")
+        selected = [int(idx) for idx in sample_indices]
+        if train_text_raw is None or test_text_raw is None:
+            print("[TextNN] text modality not present in dataset — returning empty candidates.")
+            empty = {int(idx): [] for idx in selected}
+            return empty, {}, {}, []
+
+        k = k if k is not None else self.k
+        train_text_str = self._to_str_list(train_text_raw)
+        test_text_str = self._to_str_list(test_text_raw)
+
+        n_train = len(dataset.y_train)
+        n_test = len(test_text_str)
+        ts_train_values = list((dataset.X_train_ts or {}).values())
+        ts_test_values = list((dataset.X_test_ts or {}).values())
+        train_meds = ts_train_values[0] if len(ts_train_values) > 0 else np.zeros((n_train, 1, 1), dtype=float)
+        train_labs = ts_train_values[1] if len(ts_train_values) > 1 else np.zeros((n_train, 1, 1), dtype=float)
+        test_meds = ts_test_values[0] if len(ts_test_values) > 0 else np.zeros((n_test, 1, 1), dtype=float)
+        test_labs = ts_test_values[1] if len(ts_test_values) > 1 else np.zeros((n_test, 1, 1), dtype=float)
+
+        _, indices_dict, distances_dict = find_k_closest_text(
+            X_train_static=dataset.X_train_static,
+            X_train_meds=train_meds,
+            X_train_labs=train_labs,
+            train_text_for_distance=train_text_str,
+            y_train=dataset.y_train,
+            X_test_static=dataset.X_test_static,
+            X_test_meds=test_meds,
+            X_test_labs=test_labs,
+            test_text_for_distance=test_text_str,
+            selected_test_indices=selected,
+            target_value=target_value,
+            k=k,
+            text_encoder=self.text_encoder,
+            text_distance_metric=self.text_distance_metric,
+            text_distance_fn=self.text_distance_fn,
+            text_metric_kwargs=self.text_metric_kwargs,
+            text_embed_fn=self.text_embed_fn,
+            e5_embed_fn=self.e5_embed_fn,
+            e5_tokenizer=self.e5_tokenizer,
+            e5_model=self.e5_model,
+            e5_device=self.e5_device,
+            bert_embed_fn=self.bert_embed_fn,
+            bert_tokenizer=self.bert_tokenizer,
+            bert_model=self.bert_model,
+            bert_device=self.bert_device,
+            bert_batch_size=self.bert_batch_size,
+            bert_max_length=self.bert_max_length,
+            tfidf_vectorizer=self.tfidf_vectorizer,
+            tfidf_kwargs=self.tfidf_kwargs,
+            word2vec_embed_fn=self.word2vec_embed_fn,
+            word2vec_model=self.word2vec_model,
+            train_text_raw=train_text_raw,
+            test_text_raw=test_text_raw,
+            precomputed_train_embeddings=self.precomputed_train_text_embeddings,
+            precomputed_test_embeddings=self.precomputed_test_text_embeddings,
+        )
+
+        candidates_by_sample = {
+            int(idx): self._materialize(
+                indices_dict,
+                int(idx),
+                dataset,
+                train_text_raw,
+                text_name,
+                distance_metric_label=self._resolve_distance_metric_label(),
+                text_encoder_label=self._resolve_text_encoder_label(),
+            )
+            for idx in selected
+        }
+        return candidates_by_sample, indices_dict, distances_dict, train_text_str
 
     def generate(
         self,
@@ -283,3 +380,19 @@ class TextNN(CounterfactualGenerator):
             dataset, sample_idx, target_value=target_value, k=k
         )
         return candidates
+
+    def generate_batch(
+        self,
+        dataset,
+        sample_indices,
+        model=None,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        candidates_by_sample, _, _, _ = self.generate_raw_batch(
+            dataset,
+            sample_indices,
+            target_value=target_value,
+            k=k,
+        )
+        return candidates_by_sample
