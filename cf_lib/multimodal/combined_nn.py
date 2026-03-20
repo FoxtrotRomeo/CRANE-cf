@@ -138,12 +138,11 @@ class CombinedNN(CounterfactualGenerator):
             tab_name: np.asarray(arr)
             for tab_name, arr in (dataset.X_train_tab or {}).items()
         }
-        train_text = (
-            np.asarray(dataset.X_train_text, dtype=object).reshape(-1)
-            if dataset.X_train_text is not None
-            else None
-        )
-        train_img = dataset.X_train_img   # kept as-is (rank-matched)
+        train_texts = {
+            name: np.asarray(arr, dtype=object).reshape(-1)
+            for name, arr in dataset.text_modalities("train").items()
+        }
+        train_images = dataset.image_modalities("train")
 
         results = []
         n_avail = len(selected)
@@ -164,9 +163,13 @@ class CombinedNN(CounterfactualGenerator):
                 tab_name: np.asarray(np.median(arr[subset], axis=0), dtype=float)
                 for tab_name, arr in train_tab_dict.items()
             }
-            text_val = str(train_text[anchor]) if train_text is not None else None
-            text_input = train_text[anchor] if train_text is not None else None
-            img_val = train_img[anchor] if train_img is not None else None
+            text_vals = {name: str(arr[anchor]) for name, arr in train_texts.items()}
+            text_inputs = {name: arr[anchor] for name, arr in train_texts.items()}
+            image_vals = {name: arr[anchor] for name, arr in train_images.items()}
+            image_inputs = dict(image_vals)
+            text_val = text_vals.get(dataset.primary_text_name)
+            text_input = text_inputs.get(dataset.primary_text_name)
+            img_val = image_vals.get(dataset.primary_image_name)
 
             results.append(
                 {
@@ -175,9 +178,22 @@ class CombinedNN(CounterfactualGenerator):
                     "tab": tab_meds,
                     "text": text_val,
                     "text_input": text_input,
+                    "texts": text_vals,
+                    "text_inputs": text_inputs,
                     "image": img_val,
                     "image_input": img_val,
+                    "images": image_vals,
+                    "image_inputs": image_inputs,
                     "source_train_idx": anchor,
+                    "source_indices": {
+                        "tabular": (
+                            {name: anchor for name in train_tab_dict}
+                            | ({dataset.primary_tabular_name: anchor} if train_static is not None else {})
+                        ),
+                        "ts": {name: anchor for name in train_ts_dict},
+                        "text": {name: anchor for name in train_texts},
+                        "image": {name: anchor for name in train_images},
+                    },
                     "n_neighbors_used": int(use_n),
                 }
             )
@@ -210,9 +226,9 @@ class CombinedNN(CounterfactualGenerator):
                 {
                     "tabular":        (indices_dict, distances_dict),
                     <ts_name>:        (indices_dict, distances_dict),
-                    "text":           (indices_dict, distances_dict),
-                    "train_text_str": [...],
-                    "image":          (indices_dict, distances_dict),
+                    ("text", name):   (indices_dict, distances_dict),
+                    "train_text_str": {name: [...]},
+                    ("image", name):  (indices_dict, distances_dict),
                 }
 
             Missing keys are computed on-the-fly.
@@ -276,11 +292,17 @@ class CombinedNN(CounterfactualGenerator):
                     active_idx_dist[tab_name] = (idx_tab, dist_tab)
 
         # --- text NN ---
-        if "text" in avail:
-            train_text_str = pc.get("train_text_str") or self._to_str_list(dataset.X_train_text)
-            test_text_str = self._to_str_list(dataset.X_test_text)
-            if "text" in pc:
-                active_idx_dist["text"] = pc["text"]
+        train_text_cache = pc.get("train_text_str", {})
+        for text_name in dataset.text_names():
+            cache_key = ("text", text_name)
+            train_text_raw = dataset.get_text_branch(text_name, split="train")
+            test_text_raw = dataset.get_text_branch(text_name, split="test")
+            if train_text_raw is None or test_text_raw is None:
+                continue
+            train_text_str = train_text_cache.get(text_name) or self._to_str_list(train_text_raw)
+            test_text_str = self._to_str_list(test_text_raw)
+            if cache_key in pc:
+                active_idx_dist[cache_key] = pc[cache_key]
             else:
                 ts_list = list((dataset.X_train_ts or {}).values())
                 train_ts1 = ts_list[0] if len(ts_list) > 0 else None
@@ -305,20 +327,25 @@ class CombinedNN(CounterfactualGenerator):
                     e5_tokenizer=self.e5_tokenizer,
                     e5_model=self.e5_model,
                     e5_device=self.e5_device,
-                    train_text_raw=dataset.X_train_text,
-                    test_text_raw=dataset.X_test_text,
+                    train_text_raw=train_text_raw,
+                    test_text_raw=test_text_raw,
                 )
-                active_idx_dist["text"] = (idx_text, dist_text)
+                active_idx_dist[cache_key] = (idx_text, dist_text)
 
         # --- image NN ---
-        if "image" in avail:
-            if "image" in pc:
-                active_idx_dist["image"] = pc["image"]
+        for image_name in dataset.image_names():
+            cache_key = ("image", image_name)
+            train_img = dataset.get_image_branch(image_name, split="train")
+            test_img = dataset.get_image_branch(image_name, split="test")
+            if train_img is None or test_img is None:
+                continue
+            if cache_key in pc:
+                active_idx_dist[cache_key] = pc[cache_key]
             else:
                 idx_image, dist_image = find_k_closest_image(
-                    X_train_img=dataset.X_train_img,
+                    X_train_img=train_img,
                     y_train=dataset.y_train,
-                    X_test_img=dataset.X_test_img,
+                    X_test_img=test_img,
                     selected_test_indices=[sample_idx],
                     target_value=target_value,
                     k=self.k_search,
@@ -328,7 +355,7 @@ class CombinedNN(CounterfactualGenerator):
                     device=self.img_device,
                     batch_size=self.img_batch_size,
                 )
-                active_idx_dist["image"] = (idx_image, dist_image)
+                active_idx_dist[cache_key] = (idx_image, dist_image)
 
         if not active_idx_dist:
             print("[CombinedNN] no modalities available for this dataset — returning empty candidates.")

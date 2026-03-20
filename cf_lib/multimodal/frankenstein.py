@@ -89,11 +89,13 @@ class FrankensteinNN(CounterfactualGenerator):
     @staticmethod
     def _frankenstein_partial(
         active_numeric: dict,
-        active_text,
-        active_image,
+        active_texts: dict,
+        active_images: dict,
         k: int,
         ts_names: Optional[set] = None,
         tab_names: Optional[set] = None,
+        primary_text_name: str = "__primary__",
+        primary_image_name: str = "__primary__",
     ) -> list:
         """Frankenstein combination for an arbitrary subset of modalities.
 
@@ -103,9 +105,8 @@ class FrankensteinNN(CounterfactualGenerator):
             Any combination of ``"static"``, time-series modality names, and
             named tabular modality names.
             ``idx_array_for_sample`` is a 1-D int array of sorted neighbor indices.
-        active_text : tuple (idx_array_for_sample, train_text_str_list) or None
-        active_image : tuple (idx_array_for_sample, train_img) or None
-            ``train_img`` is the raw ``X_train_img`` (list or ndarray).
+        active_texts : dict[text_name -> (idx_array_for_sample, train_text_raw)]
+        active_images : dict[image_name -> (idx_array_for_sample, train_img)]
         k : number of candidates to build
         ts_names : set of keys in ``active_numeric`` that are time-series modalities
         tab_names : set of keys in ``active_numeric`` that are named tabular modalities
@@ -114,51 +115,54 @@ class FrankensteinNN(CounterfactualGenerator):
         tab_names = set(tab_names or [])
 
         n_per = {role: len(idxs) for role, (idxs, _) in active_numeric.items()}
-        if active_text is not None:
-            n_per["text"] = len(active_text[0])
-        if active_image is not None:
-            n_per["image"] = len(active_image[0])
+        for name, (idxs, _) in (active_texts or {}).items():
+            n_per[("text", name)] = len(idxs)
+        for name, (idxs, _) in (active_images or {}).items():
+            n_per[("image", name)] = len(idxs)
         if not n_per:
             return []
         k_eff = min(k, *n_per.values())
         if k_eff <= 0:
             return []
 
-        train_text_np = (
-            np.asarray(active_text[1], dtype=object) if active_text is not None else None
-        )
-
         results = []
         for i in range(1, k_eff + 1):
             use_n = i
             candidate: dict = {}
-            source_indices: dict = {}
+            source_indices: dict = {"tabular": {}, "ts": {}, "text": {}, "image": {}}
 
             for role, (idxs, train_arr) in active_numeric.items():
                 idx_arr = np.asarray(idxs[:use_n], dtype=int)
                 vals = np.asarray(train_arr[idx_arr])
                 med = vals[0] if use_n == 1 else np.median(vals, axis=0)
                 candidate[role] = np.asarray(med, dtype=float)
-                source_indices[role] = int(idxs[i - 1])
+                if role in ts_names:
+                    source_indices["ts"][role] = int(idxs[i - 1])
+                else:
+                    source_indices["tabular"][role] = int(idxs[i - 1])
 
-            text_val = None
-            text_input = None
-            if active_text is not None:
-                text_idxs, _ = active_text
+            text_vals = {}
+            text_inputs = {}
+            for text_name, (text_idxs, train_text_raw) in (active_texts or {}).items():
+                train_text_np = np.asarray(train_text_raw, dtype=object)
                 anchor = int(text_idxs[i - 1])
-                text_val = str(train_text_np[anchor])
-                text_input = train_text_np[anchor]
-                source_indices["text"] = anchor
+                text_vals[text_name] = str(train_text_np[anchor])
+                text_inputs[text_name] = train_text_np[anchor]
+                source_indices["text"][text_name] = anchor
 
-            img_val = None
-            if active_image is not None:
-                img_idxs, train_img = active_image
+            image_vals = {}
+            image_inputs = {}
+            for image_name, (img_idxs, train_img) in (active_images or {}).items():
                 img_anchor = int(img_idxs[i - 1])
-                img_val = train_img[img_anchor]
-                source_indices["image"] = img_anchor
+                image_vals[image_name] = train_img[img_anchor]
+                image_inputs[image_name] = train_img[img_anchor]
+                source_indices["image"][image_name] = img_anchor
 
             ts_dict = {role: candidate[role] for role in candidate if role in ts_names}
             tab_dict = {role: candidate[role] for role in candidate if role in tab_names}
+            text_val = text_vals.get(primary_text_name)
+            text_input = text_inputs.get(primary_text_name)
+            img_val = image_vals.get(primary_image_name)
 
             results.append(
                 {
@@ -167,8 +171,12 @@ class FrankensteinNN(CounterfactualGenerator):
                     "tab": tab_dict,
                     "text": text_val,
                     "text_input": text_input,
+                    "texts": text_vals,
+                    "text_inputs": text_inputs,
                     "image": img_val,
                     "image_input": img_val,
+                    "images": image_vals,
+                    "image_inputs": image_inputs,
                     "source_indices": source_indices,
                     "n_neighbors_used": use_n,
                 }
@@ -202,9 +210,9 @@ class FrankensteinNN(CounterfactualGenerator):
                 {
                     "tabular":   (indices_dict, distances_dict),
                     <ts_name>:   (indices_dict, distances_dict),
-                    "text":      (indices_dict, distances_dict),
-                    "train_text_str": [...],
-                    "image":     (indices_dict, distances_dict),
+                    ("text", name):  (indices_dict, distances_dict),
+                    "train_text_str": {name: [...]},
+                    ("image", name): (indices_dict, distances_dict),
                 }
 
             Missing keys are computed on-the-fly.
@@ -271,13 +279,18 @@ class FrankensteinNN(CounterfactualGenerator):
                     tab_indices[tab_name] = idx_tab
 
         # --- text NN (skipped when not in dataset) ---
-        idx_text = None
-        train_text_str = None
-        if "text" in avail:
-            train_text_str = pc.get("train_text_str") or self._to_str_list(dataset.X_train_text)
-            test_text_str = self._to_str_list(dataset.X_test_text)
-            if "text" in pc:
-                idx_text, _ = pc["text"]
+        text_indices: Dict[str, dict] = {}
+        train_text_cache = pc.get("train_text_str", {})
+        for text_name in dataset.text_names():
+            cache_key = ("text", text_name)
+            train_text_raw = dataset.get_text_branch(text_name, split="train")
+            test_text_raw = dataset.get_text_branch(text_name, split="test")
+            if train_text_raw is None or test_text_raw is None:
+                continue
+            train_text_str = train_text_cache.get(text_name) or self._to_str_list(train_text_raw)
+            test_text_str = self._to_str_list(test_text_raw)
+            if cache_key in pc:
+                text_indices[text_name], _ = pc[cache_key]
             else:
                 ts_list = list((dataset.X_train_ts or {}).values())
                 train_ts1 = ts_list[0] if len(ts_list) > 0 else None
@@ -302,20 +315,26 @@ class FrankensteinNN(CounterfactualGenerator):
                     e5_tokenizer=self.e5_tokenizer,
                     e5_model=self.e5_model,
                     e5_device=self.e5_device,
-                    train_text_raw=dataset.X_train_text,
-                    test_text_raw=dataset.X_test_text,
+                    train_text_raw=train_text_raw,
+                    test_text_raw=test_text_raw,
                 )
+                text_indices[text_name] = idx_text
 
         # --- image NN (skipped when not in dataset) ---
-        idx_image = None
-        if "image" in avail:
-            if "image" in pc:
-                idx_image, _ = pc["image"]
+        image_indices: Dict[str, dict] = {}
+        for image_name in dataset.image_names():
+            cache_key = ("image", image_name)
+            train_img = dataset.get_image_branch(image_name, split="train")
+            test_img = dataset.get_image_branch(image_name, split="test")
+            if train_img is None or test_img is None:
+                continue
+            if cache_key in pc:
+                image_indices[image_name], _ = pc[cache_key]
             else:
                 idx_image, _ = find_k_closest_image(
-                    X_train_img=dataset.X_train_img,
+                    X_train_img=train_img,
                     y_train=dataset.y_train,
-                    X_test_img=dataset.X_test_img,
+                    X_test_img=test_img,
                     selected_test_indices=[sample_idx],
                     target_value=target_value,
                     k=self.k_search,
@@ -325,6 +344,7 @@ class FrankensteinNN(CounterfactualGenerator):
                     device=self.img_device,
                     batch_size=self.img_batch_size,
                 )
+                image_indices[image_name] = idx_image
 
         # --- build active_numeric, active_text, active_image ---
         active_numeric: dict = {}
@@ -344,29 +364,33 @@ class FrankensteinNN(CounterfactualGenerator):
                 dataset.X_train_tab[tab_name],
             )
 
-        active_text = None
-        if idx_text is not None and train_text_str is not None:
-            active_text = (
+        active_texts = {
+            text_name: (
                 np.asarray(idx_text.get(int(sample_idx), []), dtype=int),
-                train_text_str,
+                dataset.get_text_branch(text_name, split="train"),
             )
+            for text_name, idx_text in text_indices.items()
+        }
 
-        active_image = None
-        if idx_image is not None:
-            active_image = (
+        active_images = {
+            image_name: (
                 np.asarray(idx_image.get(int(sample_idx), []), dtype=int),
-                dataset.X_train_img,
+                dataset.get_image_branch(image_name, split="train"),
             )
+            for image_name, idx_image in image_indices.items()
+        }
 
-        if not active_numeric and active_text is None and active_image is None:
+        if not active_numeric and not active_texts and not active_images:
             print("[FrankensteinNN] no modalities available for this dataset — returning empty candidates.")
             return []
 
         return self._frankenstein_partial(
             active_numeric,
-            active_text,
-            active_image,
+            active_texts,
+            active_images,
             k,
             ts_names=set(ts_names),
             tab_names=set(tab_indices.keys()),
+            primary_text_name=dataset.primary_text_name,
+            primary_image_name=dataset.primary_image_name,
         )

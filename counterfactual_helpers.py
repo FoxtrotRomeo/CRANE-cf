@@ -1860,6 +1860,91 @@ def find_k_closest_frankenstein(
 
     return combined_indices_dict
 
+
+def find_k_closest_latent(
+    X_train_latent,
+    y_train,
+    X_test_latent,
+    selected_test_indices,
+    *,
+    target_value=0,
+    k=5,
+    distance_fn=euclidean_distances,
+    distance_metric=None,
+):
+    """Find nearest neighbors in an arbitrary latent space.
+
+    This is the preferred generic helper for intermediate-fusion search when
+    train/test latent representations are already available, regardless of how
+    they were produced.
+
+    Returns
+    -------
+    indices_dict, distances_dict
+        Dicts keyed by selected test index.
+    """
+    k = _validate_k(k)
+    y_train = np.asarray(y_train).reshape(-1)
+    X_train_latent = np.asarray(X_train_latent)
+    X_test_latent = np.asarray(X_test_latent)
+
+    if X_train_latent.ndim == 1:
+        X_train_latent = X_train_latent.reshape(-1, 1)
+    if X_test_latent.ndim == 1:
+        X_test_latent = X_test_latent.reshape(-1, 1)
+    if X_train_latent.ndim > 2:
+        X_train_latent = X_train_latent.reshape(X_train_latent.shape[0], -1)
+    if X_test_latent.ndim > 2:
+        X_test_latent = X_test_latent.reshape(X_test_latent.shape[0], -1)
+
+    if X_train_latent.shape[0] != y_train.shape[0]:
+        raise ValueError("X_train_latent rows must match y_train length.")
+    if X_train_latent.shape[1] != X_test_latent.shape[1]:
+        raise ValueError("Train/test latent dimensions must match.")
+
+    selected_test_indices = _normalize_selected_test_indices(
+        selected_test_indices, X_test_latent.shape[0]
+    )
+
+    candidate_indices = np.flatnonzero(y_train == target_value).astype(int)
+    n_cand = candidate_indices.shape[0]
+
+    indices_dict = {}
+    distances_dict = {}
+    if n_cand == 0:
+        empty_idx = np.empty((0,), dtype=int)
+        empty_dist = np.empty((0,), dtype=float)
+        for ti in selected_test_indices:
+            indices_dict[int(ti)] = empty_idx
+            distances_dict[int(ti)] = empty_dist
+        return indices_dict, distances_dict
+
+    sel_test = np.asarray(selected_test_indices, dtype=int)
+    query_samples = X_test_latent[sel_test]
+    candidate_samples = X_train_latent[candidate_indices]
+    dist_matrix = _pairwise_vector_distances(
+        query_samples,
+        candidate_samples,
+        distance_fn=distance_fn,
+        distance_metric=distance_metric,
+        default_metric="euclidean",
+    )
+
+    k_eff = min(k, n_cand)
+    for r, test_idx in enumerate(sel_test):
+        dists = dist_matrix[r]
+        if k_eff == n_cand:
+            sel_local = np.argsort(dists)[:k_eff]
+        else:
+            kth = max(0, min(k_eff - 1, dists.shape[0] - 1))
+            idx_k = np.argpartition(dists, kth)[:k_eff]
+            sel_local = idx_k[np.argsort(dists[idx_k])]
+        indices_dict[int(test_idx)] = candidate_indices[sel_local].astype(int)
+        distances_dict[int(test_idx)] = dists[sel_local].astype(float)
+
+    return indices_dict, distances_dict
+
+
 def find_k_closest_latent_model(
     X_train,
     y_train,
@@ -2030,49 +2115,32 @@ def find_k_closest_latent_model(
     if X_test_latent.shape[0] != X_test.shape[0]:
         raise ValueError("precomputed/test latent rows must match X_test rows.")
 
-    # Candidate indices in X_train_latent that have the requested label.
-    candidate_indices = np.flatnonzero(y_train == target_value)
-    candidate_samples = X_train_latent[candidate_indices]  # shape (n_candidates, latent_dim)
+    neighbors_indices_dict, neighbors_distances_dict = find_k_closest_latent(
+        X_train_latent=X_train_latent,
+        y_train=y_train,
+        X_test_latent=X_test_latent,
+        selected_test_indices=selected_test_indices,
+        target_value=target_value,
+        k=k,
+        distance_fn=distance_fn,
+        distance_metric=distance_metric,
+    )
 
-    n_cand = candidate_samples.shape[0]
+    n_cand = int(np.sum(y_train == target_value))
     print(f"Number of candidate samples with target value {target_value}: {n_cand}")
     if n_cand == 0:
         empty_neighbors = [] if (use_four_input or use_five_input) else X_train[:0]
-        empty_dist = np.empty((0,), dtype=float)
         neighbors = {int(ti): empty_neighbors for ti in selected_test_indices}
-        dists = {int(ti): empty_dist for ti in selected_test_indices}
         if return_indices:
-            empty_idx = np.empty((0,), dtype=int)
-            return neighbors, dists, {int(ti): empty_idx for ti in selected_test_indices}
-        return neighbors, dists
+            return neighbors, neighbors_distances_dict, neighbors_indices_dict
+        if return_latents:
+            return neighbors, neighbors_distances_dict, {
+                "train_latent": X_train_latent, "test_latent": X_test_latent
+            }
+        return neighbors, neighbors_distances_dict
 
-    k_eff = min(k, n_cand)
     neighbors_input_dict = {}
-    neighbors_distances_dict = {}
-    neighbors_indices_dict = {} if return_indices else None
-
-    sel_test = np.asarray(selected_test_indices, dtype=int)
-    query_samples = X_test_latent[sel_test]
-
-    dist_matrix = _pairwise_vector_distances(
-        query_samples,
-        candidate_samples,
-        distance_fn=distance_fn,
-        distance_metric=distance_metric,
-        default_metric="euclidean",
-    )
-
-    for r, test_idx in enumerate(sel_test):
-        dists = dist_matrix[r]
-        # Get k_eff smallest distances (unsorted via argpartition then sorted).
-        if k_eff == n_cand:
-            sel_local = np.argsort(dists)[:k_eff]
-        else:
-            kth = max(0, min(k_eff - 1, dists.shape[0] - 1))
-            idx_k = np.argpartition(dists, kth)[:k_eff]
-            sel_local = idx_k[np.argsort(dists[idx_k])]
-
-        selected_train_indices = candidate_indices[sel_local].astype(int)
+    for test_idx, selected_train_indices in neighbors_indices_dict.items():
         if use_five_input or use_four_input:
             neighbors_input_dict[int(test_idx)] = [
                 {
@@ -2093,9 +2161,6 @@ def find_k_closest_latent_model(
             ]
         else:
             neighbors_input_dict[int(test_idx)] = X_train[selected_train_indices]
-        neighbors_distances_dict[int(test_idx)] = dists[sel_local].astype(float)
-        if return_indices:
-            neighbors_indices_dict[int(test_idx)] = selected_train_indices
 
     latent_cache = {"train_latent": X_train_latent, "test_latent": X_test_latent}
     if return_indices and return_latents:

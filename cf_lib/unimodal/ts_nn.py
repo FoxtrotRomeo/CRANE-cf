@@ -163,6 +163,54 @@ class TimeSeriesNN(CounterfactualGenerator):
         )
         return candidates, indices, distances
 
+    def generate_raw_batch(
+        self,
+        dataset,
+        sample_indices,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ):
+        """Run the NN search once for many samples.
+
+        Returns ``(candidates_by_sample, indices_dict, distances_dict)``.
+        """
+        ts_train = (dataset.X_train_ts or {}).get(self.ts_name)
+        ts_test = (dataset.X_test_ts or {}).get(self.ts_name)
+        selected = [int(idx) for idx in sample_indices]
+        if ts_train is None or ts_test is None:
+            print(
+                f"[TimeSeriesNN:{self.ts_name!r}] ts_name not found in dataset "
+                "— returning empty candidates."
+            )
+            empty = {int(idx): [] for idx in selected}
+            return empty, {}, {}
+
+        k = k if k is not None else self.k
+        indices, distances = find_k_closest_ts(
+            X_train_ts=ts_train,
+            y_train=dataset.y_train,
+            X_test_ts=ts_test,
+            selected_test_indices=selected,
+            target_value=target_value,
+            k=k,
+            distance_fn=self.distance_fn,
+            distance_metric=self.distance_metric,
+            dtw_window=self.dtw_window,
+            distance_kwargs=self.distance_kwargs,
+            return_indices=True,
+        )
+        candidates_by_sample = {
+            int(idx): self._materialize(
+                indices,
+                int(idx),
+                dataset,
+                self.ts_name,
+                distance_metric_label=self._resolve_distance_metric_label(),
+            )
+            for idx in selected
+        }
+        return candidates_by_sample, indices, distances
+
     def generate(
         self,
         dataset,
@@ -175,3 +223,19 @@ class TimeSeriesNN(CounterfactualGenerator):
             dataset, sample_idx, target_value=target_value, k=k
         )
         return candidates
+
+    def generate_batch(
+        self,
+        dataset,
+        sample_indices,
+        model=None,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        candidates_by_sample, _, _ = self.generate_raw_batch(
+            dataset,
+            sample_indices,
+            target_value=target_value,
+            k=k,
+        )
+        return candidates_by_sample

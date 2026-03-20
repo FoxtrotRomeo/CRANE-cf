@@ -39,7 +39,12 @@ class EarlyFusionNN(CounterfactualGenerator):
                      modality is skipped even if present.
     precomputed_train_text_embeddings / precomputed_test_text_embeddings
                    : optional 2-D arrays reused instead of re-embedding the
-                     full train/test text splits
+                     full train/test text splits, or dicts keyed by text
+                     branch name.
+    precomputed_train_text_embeddings_by_name /
+    precomputed_test_text_embeddings_by_name
+                   : optional explicit dict[str, np.ndarray] keyed by text
+                     branch name.
     img_embed_fn   : optional callable(images) -> np.ndarray (n, D); when
                      provided it takes precedence over ``image_encoder``.
     image_encoder  : backbone for image encoding — ``"precomputed"`` (default),
@@ -62,10 +67,14 @@ class EarlyFusionNN(CounterfactualGenerator):
         e5_embed_fn: Optional[Callable] = None,
         precomputed_train_text_embeddings=None,
         precomputed_test_text_embeddings=None,
+        precomputed_train_text_embeddings_by_name=None,
+        precomputed_test_text_embeddings_by_name=None,
         img_embed_fn: Optional[Callable] = None,
         image_encoder: str = "precomputed",
         img_device: Optional[str] = None,
         img_batch_size: int = 32,
+        precomputed_train_image_embeddings_by_name=None,
+        precomputed_test_image_embeddings_by_name=None,
         distance_fn: Optional[Callable] = None,
         distance_metric: Optional[str] = None,
     ):
@@ -76,10 +85,14 @@ class EarlyFusionNN(CounterfactualGenerator):
         self.e5_embed_fn = e5_embed_fn
         self.precomputed_train_text_embeddings = precomputed_train_text_embeddings
         self.precomputed_test_text_embeddings = precomputed_test_text_embeddings
+        self.precomputed_train_text_embeddings_by_name = precomputed_train_text_embeddings_by_name
+        self.precomputed_test_text_embeddings_by_name = precomputed_test_text_embeddings_by_name
         self.img_embed_fn = img_embed_fn
         self.image_encoder = image_encoder
         self.img_device = img_device
         self.img_batch_size = img_batch_size
+        self.precomputed_train_image_embeddings_by_name = precomputed_train_image_embeddings_by_name
+        self.precomputed_test_image_embeddings_by_name = precomputed_test_image_embeddings_by_name
         self.distance_fn = distance_fn
         self.distance_metric = distance_metric
 
@@ -111,6 +124,16 @@ class EarlyFusionNN(CounterfactualGenerator):
         return emb
 
     def _has_text_support(self) -> bool:
+        if (
+            self.precomputed_train_text_embeddings_by_name is not None
+            and self.precomputed_test_text_embeddings_by_name is not None
+        ):
+            return True
+        if (
+            isinstance(self.precomputed_train_text_embeddings, dict)
+            and isinstance(self.precomputed_test_text_embeddings, dict)
+        ):
+            return True
         return (
             self.precomputed_train_text_embeddings is not None
             and self.precomputed_test_text_embeddings is not None
@@ -122,6 +145,11 @@ class EarlyFusionNN(CounterfactualGenerator):
     def _has_image_support(self, dataset) -> bool:
         if "image" not in dataset.available_modalities:
             return False
+        if (
+            self.precomputed_train_image_embeddings_by_name is not None
+            and self.precomputed_test_image_embeddings_by_name is not None
+        ):
+            return True
         if self.img_embed_fn is not None:
             return True
         enc = str(self.image_encoder).strip().lower() if self.image_encoder else "precomputed"
@@ -129,7 +157,10 @@ class EarlyFusionNN(CounterfactualGenerator):
             return True
         # Pre-computed: check that data is already a 2-D float array.
         from counterfactual_helpers import _is_image_precomputed
-        return _is_image_precomputed(dataset.X_train_img)
+        return any(
+            _is_image_precomputed(img)
+            for img in dataset.image_modalities("train").values()
+        )
 
     @staticmethod
     def _normalize_metric(metric: Optional[str], default: str = "euclidean") -> str:
@@ -203,10 +234,10 @@ class EarlyFusionNN(CounterfactualGenerator):
         static,
         ts_dict,
         tab_dict=None,
-        text_emb=None,
-        img_emb=None,
+        text_emb_dict=None,
+        img_emb_dict=None,
     ) -> np.ndarray:
-        """Concatenate [static?, named-tabular…, time-mean(ts)…, text_emb?, img_emb?].
+        """Concatenate [static?, named-tabular…, time-mean(ts)…, text_emb..., img_emb...].
 
         ``static`` may be ``None`` (skipped).  All other absent components are
         similarly skipped.  At least one component must be provided.
@@ -218,15 +249,50 @@ class EarlyFusionNN(CounterfactualGenerator):
             parts.append(np.asarray(arr, dtype=float))
         for arr in ts_dict.values():
             parts.append(np.mean(np.asarray(arr, dtype=float), axis=1))
-        if text_emb is not None:
-            parts.append(np.asarray(text_emb, dtype=float))
-        if img_emb is not None:
-            parts.append(np.asarray(img_emb, dtype=float))
+        for arr in (text_emb_dict or {}).values():
+            parts.append(np.asarray(arr, dtype=float))
+        for arr in (img_emb_dict or {}).values():
+            parts.append(np.asarray(arr, dtype=float))
         if not parts:
             raise ValueError(
                 "EarlyFusionNN: no modalities available to build a concatenated representation."
             )
         return np.concatenate(parts, axis=1)
+
+    def _resolve_precomputed_text_dicts(self, dataset):
+        train_by_name = self.precomputed_train_text_embeddings_by_name
+        test_by_name = self.precomputed_test_text_embeddings_by_name
+        if train_by_name is None and isinstance(self.precomputed_train_text_embeddings, dict):
+            train_by_name = self.precomputed_train_text_embeddings
+        if test_by_name is None and isinstance(self.precomputed_test_text_embeddings, dict):
+            test_by_name = self.precomputed_test_text_embeddings
+        if train_by_name is not None or test_by_name is not None:
+            if train_by_name is None or test_by_name is None:
+                raise ValueError(
+                    "Provide both train and test precomputed text embedding dicts."
+                )
+            return dict(train_by_name), dict(test_by_name)
+
+        if self.precomputed_train_text_embeddings is None and self.precomputed_test_text_embeddings is None:
+            return None, None
+
+        primary = dataset.resolve_text_branch_name(None)
+        return (
+            {primary: np.asarray(self.precomputed_train_text_embeddings, dtype=float)},
+            {primary: np.asarray(self.precomputed_test_text_embeddings, dtype=float)},
+        )
+
+    def _resolve_precomputed_image_dicts(self):
+        train_by_name = self.precomputed_train_image_embeddings_by_name
+        test_by_name = self.precomputed_test_image_embeddings_by_name
+        if train_by_name is None and isinstance(getattr(self, "precomputed_train_image_embeddings", None), dict):
+            train_by_name = self.precomputed_train_image_embeddings
+        if test_by_name is None and isinstance(getattr(self, "precomputed_test_image_embeddings", None), dict):
+            test_by_name = self.precomputed_test_image_embeddings
+        return (
+            dict(train_by_name) if train_by_name is not None else None,
+            dict(test_by_name) if test_by_name is not None else None,
+        )
 
     # ------------------------------------------------------------------
     def generate(
@@ -243,33 +309,78 @@ class EarlyFusionNN(CounterfactualGenerator):
         test_ts = dataset.X_test_ts or {}
         train_tab = dataset.X_train_tab or {}
         test_tab = dataset.X_test_tab or {}
+        train_text_modalities = dataset.text_modalities("train")
+        test_text_modalities = dataset.text_modalities("test")
+        train_image_modalities = dataset.image_modalities("train")
+        test_image_modalities = dataset.image_modalities("test")
 
         # --- text embeddings (optional) ---
         use_text = "text" in dataset.available_modalities and self._has_text_support()
-        if use_text and self.precomputed_train_text_embeddings is not None and self.precomputed_test_text_embeddings is not None:
-            text_emb_train = np.asarray(self.precomputed_train_text_embeddings, dtype=float)
-            text_emb_test = np.asarray(self.precomputed_test_text_embeddings, dtype=float)
-            if text_emb_train.shape[0] != len(dataset.X_train_text):
-                raise ValueError("precomputed_train_text_embeddings rows must match X_train_text.")
-            if text_emb_test.shape[0] != len(dataset.X_test_text):
-                raise ValueError("precomputed_test_text_embeddings rows must match X_test_text.")
+        pre_text_train, pre_text_test = self._resolve_precomputed_text_dicts(dataset)
+        if use_text and pre_text_train is not None and pre_text_test is not None:
+            text_emb_train = {
+                name: np.asarray(arr, dtype=float)
+                for name, arr in pre_text_train.items()
+            }
+            text_emb_test = {
+                name: np.asarray(arr, dtype=float)
+                for name, arr in pre_text_test.items()
+            }
+            for name in text_emb_train:
+                if text_emb_train[name].shape[0] != len(train_text_modalities[name]):
+                    raise ValueError(
+                        f"precomputed_train_text_embeddings rows must match text branch '{name}'."
+                    )
+                if text_emb_test[name].shape[0] != len(test_text_modalities[name]):
+                    raise ValueError(
+                        f"precomputed_test_text_embeddings rows must match text branch '{name}'."
+                    )
         else:
-            text_emb_train = self._embed_text(dataset.X_train_text) if use_text else None
-            text_emb_test = self._embed_text(dataset.X_test_text) if use_text else None
+            text_emb_train = (
+                {
+                    name: self._embed_text(texts)
+                    for name, texts in train_text_modalities.items()
+                }
+                if use_text else {}
+            )
+            text_emb_test = (
+                {
+                    name: self._embed_text(texts)
+                    for name, texts in test_text_modalities.items()
+                }
+                if use_text else {}
+            )
 
         # --- image embeddings (optional) ---
         use_img = self._has_image_support(dataset)
+        pre_img_train, pre_img_test = self._resolve_precomputed_image_dicts()
         if use_img:
             from counterfactual_helpers import _build_image_representations
-            img_emb_train, img_emb_test = _build_image_representations(
-                dataset.X_train_img, dataset.X_test_img,
-                image_encoder=self.image_encoder,
-                embed_fn=self.img_embed_fn,
-                device=self.img_device,
-                batch_size=self.img_batch_size,
-            )
+            if pre_img_train is not None and pre_img_test is not None:
+                img_emb_train = {
+                    name: np.asarray(arr, dtype=float)
+                    for name, arr in pre_img_train.items()
+                }
+                img_emb_test = {
+                    name: np.asarray(arr, dtype=float)
+                    for name, arr in pre_img_test.items()
+                }
+            else:
+                img_emb_train = {}
+                img_emb_test = {}
+                for name in train_image_modalities:
+                    emb_train, emb_test = _build_image_representations(
+                        train_image_modalities[name], test_image_modalities[name],
+                        image_encoder=self.image_encoder,
+                        embed_fn=self.img_embed_fn,
+                        device=self.img_device,
+                        batch_size=self.img_batch_size,
+                    )
+                    img_emb_train[name] = emb_train
+                    img_emb_test[name] = emb_test
         else:
-            img_emb_train = img_emb_test = None
+            img_emb_train = {}
+            img_emb_test = {}
 
         # --- build concatenated vectors ---
         X_train_concat = self._build_concat(
@@ -305,11 +416,11 @@ class EarlyFusionNN(CounterfactualGenerator):
         )
         train_ts_np = {name: np.asarray(arr, dtype=float) for name, arr in train_ts.items()}
         train_tab_np = {name: np.asarray(arr, dtype=float) for name, arr in train_tab.items()}
-        train_text = (
-            np.asarray(dataset.X_train_text, dtype=object).reshape(-1)
-            if dataset.X_train_text is not None else None
-        )
-        train_img = dataset.X_train_img   # rank-matched retrieval
+        train_texts = {
+            name: np.asarray(arr, dtype=object).reshape(-1)
+            for name, arr in train_text_modalities.items()
+        }
+        train_imgs = train_image_modalities
 
         results = []
         for i in range(1, k_eff + 1):
@@ -329,9 +440,13 @@ class EarlyFusionNN(CounterfactualGenerator):
                 name: np.asarray(np.median(arr[subset], axis=0), dtype=float)
                 for name, arr in train_tab_np.items()
             }
-            text_val = str(train_text[anchor]) if train_text is not None else None
-            text_input = train_text[anchor] if train_text is not None else None
-            img_val = train_img[anchor] if train_img is not None else None
+            text_vals = {name: str(arr[anchor]) for name, arr in train_texts.items()}
+            text_inputs = {name: arr[anchor] for name, arr in train_texts.items()}
+            image_vals = {name: arr[anchor] for name, arr in train_imgs.items()}
+            image_inputs = dict(image_vals)
+            text_val = text_vals.get(dataset.primary_text_name)
+            text_input = text_inputs.get(dataset.primary_text_name)
+            img_val = image_vals.get(dataset.primary_image_name)
 
             results.append(
                 {
@@ -340,10 +455,203 @@ class EarlyFusionNN(CounterfactualGenerator):
                     "tab": tab_meds,
                     "text": text_val,
                     "text_input": text_input,
+                    "texts": text_vals,
+                    "text_inputs": text_inputs,
                     "image": img_val,
                     "image_input": img_val,
+                    "images": image_vals,
+                    "image_inputs": image_inputs,
                     "source_train_idx": anchor,
+                    "source_indices": {
+                        "tabular": (
+                            {name: anchor for name in train_tab_np}
+                            | ({dataset.primary_tabular_name: anchor} if train_static is not None else {})
+                        ),
+                        "ts": {name: anchor for name in train_ts_np},
+                        "text": {name: anchor for name in train_texts},
+                        "image": {name: anchor for name in train_imgs},
+                    },
                     "n_neighbors_used": int(use_n),
                 }
             )
         return results
+
+    def generate_batch(
+        self,
+        dataset,
+        sample_indices,
+        model=None,
+        target_value: int = 0,
+        k: Optional[int] = None,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        k = k if k is not None else self.k
+        selected = [int(idx) for idx in sample_indices]
+
+        train_ts = dataset.X_train_ts or {}
+        test_ts = dataset.X_test_ts or {}
+        train_tab = dataset.X_train_tab or {}
+        test_tab = dataset.X_test_tab or {}
+        train_text_modalities = dataset.text_modalities("train")
+        test_text_modalities = dataset.text_modalities("test")
+        train_image_modalities = dataset.image_modalities("train")
+        test_image_modalities = dataset.image_modalities("test")
+
+        use_text = "text" in dataset.available_modalities and self._has_text_support()
+        pre_text_train, pre_text_test = self._resolve_precomputed_text_dicts(dataset)
+        if use_text and pre_text_train is not None and pre_text_test is not None:
+            text_emb_train = {
+                name: np.asarray(arr, dtype=float)
+                for name, arr in pre_text_train.items()
+            }
+            text_emb_test = {
+                name: np.asarray(arr, dtype=float)
+                for name, arr in pre_text_test.items()
+            }
+            for name in text_emb_train:
+                if text_emb_train[name].shape[0] != len(train_text_modalities[name]):
+                    raise ValueError(
+                        f"precomputed_train_text_embeddings rows must match text branch '{name}'."
+                    )
+                if text_emb_test[name].shape[0] != len(test_text_modalities[name]):
+                    raise ValueError(
+                        f"precomputed_test_text_embeddings rows must match text branch '{name}'."
+                    )
+        else:
+            text_emb_train = (
+                {
+                    name: self._embed_text(texts)
+                    for name, texts in train_text_modalities.items()
+                }
+                if use_text else {}
+            )
+            text_emb_test = (
+                {
+                    name: self._embed_text(texts)
+                    for name, texts in test_text_modalities.items()
+                }
+                if use_text else {}
+            )
+
+        use_img = self._has_image_support(dataset)
+        pre_img_train, pre_img_test = self._resolve_precomputed_image_dicts()
+        if use_img:
+            from counterfactual_helpers import _build_image_representations
+            if pre_img_train is not None and pre_img_test is not None:
+                img_emb_train = {
+                    name: np.asarray(arr, dtype=float)
+                    for name, arr in pre_img_train.items()
+                }
+                img_emb_test = {
+                    name: np.asarray(arr, dtype=float)
+                    for name, arr in pre_img_test.items()
+                }
+            else:
+                img_emb_train = {}
+                img_emb_test = {}
+                for name in train_image_modalities:
+                    emb_train, emb_test = _build_image_representations(
+                        train_image_modalities[name], test_image_modalities[name],
+                        image_encoder=self.image_encoder,
+                        embed_fn=self.img_embed_fn,
+                        device=self.img_device,
+                        batch_size=self.img_batch_size,
+                    )
+                    img_emb_train[name] = emb_train
+                    img_emb_test[name] = emb_test
+        else:
+            img_emb_train = {}
+            img_emb_test = {}
+
+        X_train_concat = self._build_concat(
+            dataset.X_train_static, train_ts, train_tab, text_emb_train, img_emb_train
+        )
+        X_test_concat = self._build_concat(
+            dataset.X_test_static, test_ts, test_tab, text_emb_test, img_emb_test
+        )
+
+        y_train = np.asarray(dataset.y_train).reshape(-1)
+        candidate_indices = np.flatnonzero(y_train == target_value)
+        if candidate_indices.size == 0:
+            return {int(idx): [] for idx in selected}
+
+        query = X_test_concat[np.asarray(selected, dtype=int)]
+        candidate_vecs = X_train_concat[candidate_indices]
+        dist_matrix = self._distance_matrix(query, candidate_vecs)
+
+        train_static = (
+            np.asarray(dataset.X_train_static, dtype=float)
+            if dataset.X_train_static is not None else None
+        )
+        train_ts_np = {name: np.asarray(arr, dtype=float) for name, arr in train_ts.items()}
+        train_tab_np = {name: np.asarray(arr, dtype=float) for name, arr in train_tab.items()}
+        train_texts = {
+            name: np.asarray(arr, dtype=object).reshape(-1)
+            for name, arr in train_text_modalities.items()
+        }
+        train_imgs = train_image_modalities
+
+        batch_results: Dict[int, List[Dict[str, Any]]] = {}
+        k_eff = min(k, candidate_indices.size)
+        for r, sample_idx in enumerate(selected):
+            dists_row = dist_matrix[r]
+            if k_eff == candidate_indices.size:
+                sorted_local = np.argsort(dists_row)[:k_eff]
+            else:
+                part = np.argpartition(dists_row, k_eff - 1)[:k_eff]
+                sorted_local = part[np.argsort(dists_row[part])]
+
+            neighbor_train_idx = candidate_indices[sorted_local]
+            results = []
+            for i in range(1, k_eff + 1):
+                use_n = min(2 * i - 1, k_eff)
+                subset = neighbor_train_idx[:use_n]
+                anchor = int(neighbor_train_idx[i - 1])
+
+                static_med = (
+                    np.asarray(np.median(train_static[subset], axis=0), dtype=float)
+                    if train_static is not None else None
+                )
+                ts_meds = {
+                    name: np.asarray(np.median(arr[subset], axis=0), dtype=float)
+                    for name, arr in train_ts_np.items()
+                }
+                tab_meds = {
+                    name: np.asarray(np.median(arr[subset], axis=0), dtype=float)
+                    for name, arr in train_tab_np.items()
+                }
+                text_vals = {name: str(arr[anchor]) for name, arr in train_texts.items()}
+                text_inputs = {name: arr[anchor] for name, arr in train_texts.items()}
+                image_vals = {name: arr[anchor] for name, arr in train_imgs.items()}
+                image_inputs = dict(image_vals)
+                text_val = text_vals.get(dataset.primary_text_name)
+                text_input = text_inputs.get(dataset.primary_text_name)
+                img_val = image_vals.get(dataset.primary_image_name)
+
+                results.append(
+                    {
+                        "static": static_med,
+                        "ts": ts_meds,
+                        "tab": tab_meds,
+                        "text": text_val,
+                        "text_input": text_input,
+                        "texts": text_vals,
+                        "text_inputs": text_inputs,
+                        "image": img_val,
+                        "image_input": img_val,
+                        "images": image_vals,
+                        "image_inputs": image_inputs,
+                        "source_train_idx": anchor,
+                        "source_indices": {
+                            "tabular": (
+                                {name: anchor for name in train_tab_np}
+                                | ({dataset.primary_tabular_name: anchor} if train_static is not None else {})
+                            ),
+                            "ts": {name: anchor for name in train_ts_np},
+                            "text": {name: anchor for name in train_texts},
+                            "image": {name: anchor for name in train_imgs},
+                        },
+                        "n_neighbors_used": int(use_n),
+                    }
+                )
+            batch_results[int(sample_idx)] = results
+        return batch_results
