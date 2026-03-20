@@ -51,6 +51,8 @@ def build_dataset_and_model(
     model_path: Optional[str] = None,
     ts_modalities: Optional[Sequence[str]] = None,
     tab_modalities: Optional[Sequence[str]] = None,
+    text_modalities: Optional[Sequence[str]] = None,
+    image_modalities: Optional[Sequence[str]] = None,
     load_text: bool = True,
     load_image: bool = False,
     image_encoder: str = "precomputed",
@@ -63,9 +65,13 @@ def build_dataset_and_model(
     Optional files:
       - static:  ``X_train_static.npy``, ``X_test_static.npy``
       - labels:  ``y_test.npy``
-      - text:    ``X_train_text.npy``, ``X_test_text.npy`` (when ``load_text=True``)
-      - image:   ``X_train_img.npy``, ``X_test_img.npy``  (when ``load_image=True``)
-                 Pre-computed embeddings (n, D) or raw pixel arrays.
+      - text:    ``X_train_text.npy``, ``X_test_text.npy`` (legacy single-branch),
+                 or ``X_train_text_{name}.npy``, ``X_test_text_{name}.npy``
+                 for named branches listed in ``text_modalities``
+      - image:   ``X_train_img.npy``, ``X_test_img.npy`` (legacy single-branch),
+                 or ``X_train_img_{name}.npy``, ``X_test_img_{name}.npy``
+                 for named branches listed in ``image_modalities``.
+                 Image arrays may be pre-computed embeddings ``(n, D)`` or raw pixels.
       - TS modality ``m``: ``X_train_ts_{m}.npy``, ``X_test_ts_{m}.npy``
       - Tab modality ``m``: ``X_train_tab_{m}.npy``, ``X_test_tab_{m}.npy``
 
@@ -119,27 +125,47 @@ def build_dataset_and_model(
         else:
             print(f"[factory] Skipping tab modality '{name}' (missing files).")
 
-    X_train_text = None
-    X_test_text = None
+    X_train_texts = {}
+    X_test_texts = {}
     if load_text:
-        tr_text = root / "X_train_text.npy"
-        te_text = root / "X_test_text.npy"
-        if tr_text.exists() and te_text.exists():
-            X_train_text = _load_npy(tr_text)
-            X_test_text = _load_npy(te_text)
+        if text_modalities:
+            for name in list(text_modalities):
+                tr_text = root / f"X_train_text_{name}.npy"
+                te_text = root / f"X_test_text_{name}.npy"
+                if tr_text.exists() and te_text.exists():
+                    X_train_texts[str(name)] = _load_npy(tr_text)
+                    X_test_texts[str(name)] = _load_npy(te_text)
+                else:
+                    print(f"[factory] Skipping text modality '{name}' (missing files).")
         else:
-            print("[factory] Text files not found, proceeding without text.")
+            tr_text = root / "X_train_text.npy"
+            te_text = root / "X_test_text.npy"
+            if tr_text.exists() and te_text.exists():
+                X_train_texts["text"] = _load_npy(tr_text)
+                X_test_texts["text"] = _load_npy(te_text)
+            else:
+                print("[factory] Text files not found, proceeding without text.")
 
-    X_train_img = None
-    X_test_img = None
+    X_train_images = {}
+    X_test_images = {}
     if load_image:
-        tr_img = root / "X_train_img.npy"
-        te_img = root / "X_test_img.npy"
-        if tr_img.exists() and te_img.exists():
-            X_train_img = _load_npy(tr_img)
-            X_test_img = _load_npy(te_img)
+        if image_modalities:
+            for name in list(image_modalities):
+                tr_img = root / f"X_train_img_{name}.npy"
+                te_img = root / f"X_test_img_{name}.npy"
+                if tr_img.exists() and te_img.exists():
+                    X_train_images[str(name)] = _load_npy(tr_img)
+                    X_test_images[str(name)] = _load_npy(te_img)
+                else:
+                    print(f"[factory] Skipping image modality '{name}' (missing files).")
         else:
-            print("[factory] Image files not found, proceeding without image modality.")
+            tr_img = root / "X_train_img.npy"
+            te_img = root / "X_test_img.npy"
+            if tr_img.exists() and te_img.exists():
+                X_train_images["image"] = _load_npy(tr_img)
+                X_test_images["image"] = _load_npy(te_img)
+            else:
+                print("[factory] Image files not found, proceeding without image modality.")
 
     dataset = MultimodalDataset(
         y_train=y_train,
@@ -149,10 +175,16 @@ def build_dataset_and_model(
         X_test_ts=(X_test_ts or None),
         X_train_tab=(X_train_tab or None),
         X_test_tab=(X_test_tab or None),
-        X_train_text=X_train_text,
-        X_test_text=X_test_text,
-        X_train_img=X_train_img,
-        X_test_img=X_test_img,
+        X_train_texts=(X_train_texts or None),
+        X_test_texts=(X_test_texts or None),
+        X_train_images=(X_train_images or None),
+        X_test_images=(X_test_images or None),
+        primary_text_name=(
+            str(next(iter(X_train_texts))) if X_train_texts else "__primary__"
+        ),
+        primary_image_name=(
+            str(next(iter(X_train_images))) if X_train_images else "__primary__"
+        ),
         y_test=y_test,
     )
 
@@ -211,21 +243,37 @@ def build_synthetic_dataset_and_model(
     }
 
     vocab = np.array(["alpha", "beta", "gamma", "delta", "icu", "ward", "discharge"])
-    X_train_text = np.array(
-        [" ".join(rng.choice(vocab, size=6, replace=True)) for _ in range(n_train)],
-        dtype=object,
-    )
-    X_test_text = np.array(
-        [" ".join(rng.choice(vocab, size=6, replace=True)) for _ in range(n_test)],
-        dtype=object,
-    )
+    X_train_texts = {
+        "report": np.array(
+            [" ".join(rng.choice(vocab, size=6, replace=True)) for _ in range(n_train)],
+            dtype=object,
+        ),
+        "notes": np.array(
+            [" ".join(rng.choice(vocab, size=5, replace=True)) for _ in range(n_train)],
+            dtype=object,
+        ),
+    }
+    X_test_texts = {
+        "report": np.array(
+            [" ".join(rng.choice(vocab, size=6, replace=True)) for _ in range(n_test)],
+            dtype=object,
+        ),
+        "notes": np.array(
+            [" ".join(rng.choice(vocab, size=5, replace=True)) for _ in range(n_test)],
+            dtype=object,
+        ),
+    }
 
     # Synthetic pre-computed image embeddings (2-D → treated as precomputed by ImageNN).
-    X_train_img = None
-    X_test_img = None
+    X_train_images = None
+    X_test_images = None
     if d_img > 0:
-        X_train_img = rng.normal(size=(n_train, d_img)).astype(np.float32)
-        X_test_img = rng.normal(size=(n_test, d_img)).astype(np.float32)
+        X_train_images = {
+            "cxr": rng.normal(size=(n_train, d_img)).astype(np.float32),
+        }
+        X_test_images = {
+            "cxr": rng.normal(size=(n_test, d_img)).astype(np.float32),
+        }
 
     dataset = MultimodalDataset(
         y_train=y_train,
@@ -233,10 +281,12 @@ def build_synthetic_dataset_and_model(
         X_test_static=X_test_static,
         X_train_ts=X_train_ts,
         X_test_ts=X_test_ts,
-        X_train_text=X_train_text,
-        X_test_text=X_test_text,
-        X_train_img=X_train_img,
-        X_test_img=X_test_img,
+        X_train_texts=X_train_texts,
+        X_test_texts=X_test_texts,
+        X_train_images=X_train_images,
+        X_test_images=X_test_images,
+        primary_text_name="report",
+        primary_image_name="cxr",
         y_test=y_test,
     )
 

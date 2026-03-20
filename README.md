@@ -5,7 +5,8 @@
 `cf-lib` generates counterfactual explanations for multimodal classifiers by
 searching for the closest opposite-class training samples in configurable
 distance spaces. It supports tabular, time-series, text, and image modalities,
-and provides several combination strategies.
+including multiple named branches of the same modality type, and provides
+several combination strategies.
 
 > If you use this library in your research, please cite the associated paper
 > (see [CITATION.cff](CITATION.cff)).
@@ -56,10 +57,12 @@ dataset = MultimodalDataset(
     X_test_static=X_test_static,     # np.ndarray (n_test,  D_static)
     X_train_ts={"labs": arr_train_labs, "meds": arr_train_meds},
     X_test_ts= {"labs": arr_test_labs,  "meds": arr_test_meds},
-    X_train_text=train_texts,
-    X_test_text=test_texts,
-    X_train_img=train_images,        # PIL list, ndarray, or pre-computed embeddings
-    X_test_img=test_images,
+    X_train_texts={"report": train_reports, "notes": train_notes},
+    X_test_texts={"report": test_reports, "notes": test_notes},
+    X_train_images={"cxr": train_cxr},  # PIL list, ndarray, or pre-computed embeddings
+    X_test_images={"cxr": test_cxr},
+    primary_text_name="report",
+    primary_image_name="cxr",
 )
 
 lib = CounterfactualLibrary(
@@ -67,7 +70,8 @@ lib = CounterfactualLibrary(
         "Tabular":       TabularNN(k=50),
         "Labs TS":       TimeSeriesNN("labs", k=50),
         "Meds TS":       TimeSeriesNN("meds", k=50),
-        "Image":         ImageNN(k=20, image_encoder="resnet50"),
+        "Notes":         TextNN(text_name="notes", k=20, text_encoder="tfidf"),
+        "Image":         ImageNN(image_name="cxr", k=20, image_encoder="resnet50"),
         "Frankenstein":  FrankensteinNN(image_encoder="resnet50"),
         "Combined":      CombinedNN(image_encoder="resnet50"),
     }
@@ -89,15 +93,15 @@ results = lib.generate(dataset, sample_idx=3, target_value=0)
 | `TimeSeriesNN` | Nearest neighbours in a named time-series space (DTW / Euclidean / LCSS) |
 | `LabsNN` | Alias for `TimeSeriesNN("labs")` |
 | `MedsNN` | Alias for `TimeSeriesNN("meds")` |
-| `TextNN` | Nearest neighbours in text space (E5, BERT, TF-IDF, Word2Vec, BLEU, ROUGE) |
-| `ImageNN` | Nearest neighbours in image space (ResNet-50, EfficientNet-B0, CLIP ViT-B/32, or pre-computed embeddings) |
+| `TextNN` | Nearest neighbours in a named text branch (`text_name`) using E5, BERT, TF-IDF, Word2Vec, BLEU, ROUGE, etc. |
+| `ImageNN` | Nearest neighbours in a named image branch (`image_name`) using ResNet-50, EfficientNet-B0, CLIP ViT-B/32, or pre-computed embeddings |
 
 ### Multimodal
 
 | Class | Description |
 |---|---|
-| `EarlyFusionNN` | NN in the concatenated multimodal feature space (static + TS-mean + text + image) |
-| `IntermediateFusionNN` | NN in the classifier's latent (penultimate-layer) space — requires a Keras model; supports image input |
+| `EarlyFusionNN` | NN in the concatenated multimodal feature space across all named tabular, TS, text, and image branches |
+| `IntermediateFusionNN` | NN in a latent space provided explicitly via precomputed train/test latents or `latent_fn`; legacy Keras fallback retained |
 | `FrankensteinNN` | Independent per-modality searches; assembled by combining the best neighbours from each |
 | `CombinedNN` | Per-modality searches intersected by shared candidates, ranked by summed distance |
 
@@ -120,10 +124,59 @@ MultimodalDataset(
     X_test_tab=None,         # dict[str, np.ndarray (n_test,  D)]
     X_train_text=None,       # array-like of strings, length n_train
     X_test_text=None,        # array-like of strings, length n_test
+    X_train_texts=None,      # dict[str, array-like], named text branches
+    X_test_texts=None,
     X_train_img=None,        # PIL list | ndarray (n,H,W,C) | pre-computed (n,D)
     X_test_img=None,         # same format as X_train_img
+    X_train_images=None,     # dict[str, image-like], named image branches
+    X_test_images=None,
+    X_train_tabular=None,    # optional normalized dict incl. primary static branch
+    X_test_tabular=None,
+    primary_tabular_name="__primary__",
+    primary_text_name="__primary__",
+    primary_image_name="__primary__",
     y_test=None,             # np.ndarray (n_test,), optional
 )
+```
+
+The legacy flat fields (`X_train_text`, `X_train_img`, `X_train_static`, etc.)
+are still accepted. Internally the dataset normalizes them into named branch
+dicts and keeps the legacy flat attributes pointed at the chosen primary branch
+for backward compatibility.
+
+For new code, prefer the named-branch fields (`X_train_texts`,
+`X_train_images`, `X_train_tabular`, etc.) as the source of truth and let
+`MultimodalDataset` derive the legacy flat compatibility view automatically.
+Avoid passing the same primary branch through both the legacy flat field and
+the named dict at the same time.
+
+## Candidate payloads
+
+Generators now emit named modality payloads in addition to the legacy flat
+single-branch fields.
+
+Typical candidate structure:
+
+```python
+{
+    "static": ...,            # legacy primary tabular branch when present
+    "tab": {...},             # named tabular branches
+    "ts": {...},              # named time-series branches
+    "text": "...",            # legacy primary text branch
+    "text_input": ...,        # legacy primary raw text payload
+    "texts": {...},           # named text branches
+    "text_inputs": {...},     # named raw text payloads
+    "image": ...,             # legacy primary image branch
+    "image_input": ...,       # legacy primary raw image payload
+    "images": {...},          # named image branches
+    "image_inputs": {...},    # named raw image payloads
+    "source_indices": {       # source training rows per modality branch
+        "tabular": {...},
+        "ts": {...},
+        "text": {...},
+        "image": {...},
+    },
+}
 ```
 
 **Image input formats accepted by `ImageNN` and multimodal generators:**
@@ -141,9 +194,15 @@ The `examples/` directory contains two scripts:
 
 - **`ablation_factory_template.py`** — factory functions that load a
   `MultimodalDataset` from `.npy` files on disk, or generate a synthetic
-  dataset for smoke-testing.
+  dataset for smoke-testing. The file-based factory supports both legacy
+  single-branch files (`X_train_text.npy`, `X_train_img.npy`) and named-branch
+  files such as `X_train_text_<name>.npy` / `X_train_img_<name>.npy` via
+  `text_modalities` and `image_modalities`.
 - **`run_distance_ablation.py`** — CLI runner that sweeps combinations of
   distance metrics across all modalities and saves results to JSON/pickle.
+  When the dataset contains multiple named text or image branches, the runner
+  automatically registers one `TextNN` / `ImageNN` per branch unless the
+  factory disables that behavior via backend kwargs.
 
 Run from the **repository root**:
 
@@ -158,7 +217,7 @@ python examples/run_distance_ablation.py \
 # Real data with image encoder sweep
 python examples/run_distance_ablation.py \
   --factory ablation_factory_template:build_dataset_and_model \
-  --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "load_image": true, "image_encoder": "resnet50"}' \
+  --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "text_modalities": ["report", "notes"], "image_modalities": ["cxr"], "load_image": true, "image_encoder": "resnet50"}' \
   --image-encoders resnet50 \
   --image-distance-metrics cosine,euclidean \
   --n-jobs 4 \
@@ -201,10 +260,23 @@ If parallel runs use BLAS-backed numeric kernels, prefer
 thread explosions.
 
 Factories may also provide
-`text_backend_kwargs["precomputed_text_embeddings_by_encoder"] = {encoder: {"train": ..., "test": ...}}`.
+`text_backend_kwargs["precomputed_text_embeddings_by_encoder"]` in either of
+these formats:
+
+- `{encoder: {"train": ..., "test": ...}}` for the primary text branch
+- `{text_name: {encoder: {"train": ..., "test": ...}}}` for named text branches
+
 When present, `TextNN` and downstream multimodal generators reuse those
 precomputed matrices instead of re-embedding the full train/test text corpus
 for every sample or combo.
+
+Factories may also set:
+
+- `text_backend_kwargs["auto_text_branch_generators"] = False`
+- `image_backend_kwargs["auto_image_branch_generators"] = False`
+
+to keep the generic ablation runner from auto-registering per-branch text or
+image generators when a project provides custom branch-aware generators.
 
 ---
 

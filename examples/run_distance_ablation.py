@@ -36,6 +36,7 @@ import itertools
 import json
 import os
 import pickle
+import sys
 import time
 import traceback
 from datetime import datetime
@@ -43,6 +44,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+if __package__ in {None, ""}:
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 
 from cf_lib import CounterfactualLibrary
 from cf_lib.unimodal import TabularNN, TimeSeriesNN, TextNN, ImageNN
@@ -130,12 +136,17 @@ def _infer_n_test(dataset) -> int:
     """Return the number of test samples, regardless of which modalities are present."""
     if dataset.X_test_static is not None:
         return int(np.asarray(dataset.X_test_static).shape[0])
+    test_tabulars = dataset.X_test_tabular or {}
+    if test_tabulars:
+        return int(np.asarray(next(iter(test_tabulars.values()))).shape[0])
     if dataset.y_test is not None:
         return int(len(dataset.y_test))
-    if dataset.X_test_text is not None:
-        return int(len(dataset.X_test_text))
-    if dataset.X_test_img is not None:
-        return int(len(dataset.X_test_img))
+    test_texts = dataset.text_modalities(split="test")
+    if test_texts:
+        return int(len(next(iter(test_texts.values()))))
+    test_images = dataset.image_modalities(split="test")
+    if test_images:
+        return int(len(next(iter(test_images.values()))))
     if dataset.X_test_ts:
         return int(next(iter(dataset.X_test_ts.values())).shape[0])
     raise ValueError(
@@ -285,6 +296,7 @@ def _build_image_configs(
 
 def _build_generators_for_combo(
     *,
+    dataset,
     k: int,
     tab_metrics_by_name: Dict[str, str],
     ts_metrics_by_name: Dict[str, Dict[str, Any]],
@@ -294,10 +306,11 @@ def _build_generators_for_combo(
     image_backend_kwargs: Dict[str, Any],
 ):
     generators = {}
+    primary_tab_name = dataset.primary_tabular_name
 
     # Primary static/tabular + named tabular modalities
     for tab_name, metric in tab_metrics_by_name.items():
-        if tab_name == "__primary__":
+        if tab_name == primary_tab_name:
             generators["Tabular"] = TabularNN(k=k, distance_metric=metric)
         else:
             generators[f"Tabular[{tab_name}]"] = TabularNN(
@@ -317,29 +330,57 @@ def _build_generators_for_combo(
 
     # Text modality (optional)
     if text_cfg is not None:
-        text_kwargs = dict(
-            k=k,
-            text_encoder=text_cfg["encoder"],
-            text_distance_metric=text_cfg["metric"],
-        )
-        text_kwargs.update(_filter_kwargs_for_callable(TextNN.__init__, text_backend_kwargs))
+        auto_text_branches = bool(text_backend_kwargs.get("auto_text_branch_generators", True))
+        if auto_text_branches:
+            text_branch_names = dataset.text_names()
+        else:
+            text_branch_names = (
+                [dataset.primary_text_name]
+                if dataset.primary_text_name is not None
+                else []
+            )
         precomputed_by_encoder = text_backend_kwargs.get("precomputed_text_embeddings_by_encoder")
-        if isinstance(precomputed_by_encoder, dict):
-            precomputed = precomputed_by_encoder.get(text_cfg["encoder"])
-            if isinstance(precomputed, dict):
-                text_kwargs["precomputed_train_text_embeddings"] = precomputed.get("train")
-                text_kwargs["precomputed_test_text_embeddings"] = precomputed.get("test")
-        generators["Text"] = TextNN(**text_kwargs)
+        for text_name in text_branch_names:
+            text_kwargs = dict(
+                text_name=text_name,
+                k=k,
+                text_encoder=text_cfg["encoder"],
+                text_distance_metric=text_cfg["metric"],
+            )
+            text_kwargs.update(_filter_kwargs_for_callable(TextNN.__init__, text_backend_kwargs))
+            if isinstance(precomputed_by_encoder, dict):
+                precomputed = precomputed_by_encoder.get(text_name)
+                if precomputed is None and text_name == dataset.primary_text_name:
+                    precomputed = precomputed_by_encoder.get(text_cfg["encoder"])
+                elif isinstance(precomputed, dict):
+                    precomputed = precomputed.get(text_cfg["encoder"])
+                if isinstance(precomputed, dict):
+                    text_kwargs["precomputed_train_text_embeddings"] = precomputed.get("train")
+                    text_kwargs["precomputed_test_text_embeddings"] = precomputed.get("test")
+            gen_name = "Text" if text_name == dataset.primary_text_name else f"Text[{text_name}]"
+            generators[gen_name] = TextNN(**text_kwargs)
 
     # Image modality (optional)
     if image_cfg is not None:
-        image_kwargs = dict(
-            k=k,
-            image_encoder=image_cfg["encoder"],
-            image_distance_metric=image_cfg["metric"],
-        )
-        image_kwargs.update(_filter_kwargs_for_callable(ImageNN.__init__, image_backend_kwargs))
-        generators["Image"] = ImageNN(**image_kwargs)
+        auto_image_branches = bool(image_backend_kwargs.get("auto_image_branch_generators", True))
+        if auto_image_branches:
+            image_branch_names = dataset.image_names()
+        else:
+            image_branch_names = (
+                [dataset.primary_image_name]
+                if dataset.primary_image_name is not None
+                else []
+            )
+        for image_name in image_branch_names:
+            image_kwargs = dict(
+                image_name=image_name,
+                k=k,
+                image_encoder=image_cfg["encoder"],
+                image_distance_metric=image_cfg["metric"],
+            )
+            image_kwargs.update(_filter_kwargs_for_callable(ImageNN.__init__, image_backend_kwargs))
+            gen_name = "Image" if image_name == dataset.primary_image_name else f"Image[{image_name}]"
+            generators[gen_name] = ImageNN(**image_kwargs)
 
     return generators
 
@@ -377,7 +418,13 @@ def _evaluate_combo_objectives(
         np.asarray(dataset.X_test_static)
         if dataset.X_test_static is not None else None
     )
-    X_test_text = getattr(dataset, "X_test_text", None)
+    X_test_text = (
+        dataset.get_text_branch(dataset.primary_text_name, split="test")
+        if dataset.primary_text_name is not None
+        else None
+    )
+    X_test_texts = dataset.text_modalities(split="test")
+    X_test_images = dataset.image_modalities(split="test")
 
     # accumulators: {generator_name: {objective: [values]}}
     accum: Dict[str, Dict[str, list]] = {}
@@ -398,21 +445,60 @@ def _evaluate_combo_objectives(
             for cand in (candidates or []):
                 x_tab_cand = cand.get("static")
                 text_cand = cand.get("text") or cand.get("text_input")
+                # Strip private/internal keys (those starting with "_") before forwarding
+                # to compute_objectives, which does not accept arbitrary kwargs.
+                clean_kw = {k: v for k, v in objectives_kwargs.items()
+                            if not k.startswith("_")}
                 # Support per-candidate multi-field text objectives via _text_modalities_fn.
                 # When present, it returns {"text_modalities": {...}} keyed by field name,
                 # replacing the single flat text_candidate/text_factual args.
                 _tmf = objectives_kwargs.get("_text_modalities_fn")
                 if _tmf is not None:
                     extra_text_kw = _tmf(sample_idx, cand, text_factual)
+                elif isinstance(cand.get("texts"), dict):
+                    text_ctx_default = clean_kw.get("text_objective_context")
+                    text_ctx_by_name = clean_kw.get("text_objective_contexts", {}) or {}
+                    extra_text_kw = {
+                        "text_modalities": {
+                            name: {
+                                "candidate": cand["texts"].get(name),
+                                "factual": (
+                                    X_test_texts.get(name)[sample_idx]
+                                    if name in X_test_texts and len(X_test_texts.get(name)) > sample_idx
+                                    else None
+                                ),
+                                "context": text_ctx_by_name.get(name, text_ctx_default),
+                            }
+                            for name in cand["texts"].keys()
+                        }
+                    }
                 else:
                     extra_text_kw = {
                         "text_candidate": text_cand if text_cand is not None else text_factual,
                         "text_factual": text_factual,
                     }
-                # Strip private/internal keys (those starting with "_") before forwarding
-                # to compute_objectives, which does not accept arbitrary kwargs.
-                clean_kw = {k: v for k, v in objectives_kwargs.items()
-                            if not k.startswith("_")}
+                _imf = objectives_kwargs.get("_image_modalities_fn")
+                if _imf is not None:
+                    extra_image_kw = _imf(sample_idx, cand)
+                elif isinstance(cand.get("images"), dict):
+                    image_ctx_default = clean_kw.get("image_objective_context")
+                    image_ctx_by_name = clean_kw.get("image_objective_contexts", {}) or {}
+                    extra_image_kw = {
+                        "image_modalities": {
+                            name: {
+                                "candidate": cand["images"].get(name),
+                                "factual": (
+                                    X_test_images.get(name)[sample_idx]
+                                    if name in X_test_images and len(X_test_images.get(name)) > sample_idx
+                                    else None
+                                ),
+                                "context": image_ctx_by_name.get(name, image_ctx_default),
+                            }
+                            for name in cand["images"].keys()
+                        }
+                    }
+                else:
+                    extra_image_kw = {}
                 try:
                     objs = compute_objectives(
                         x_tab=x_tab_cand,
@@ -421,6 +507,7 @@ def _evaluate_combo_objectives(
                         embedding_cache=embedding_cache,
                         text_metrics_cache=text_metrics_cache,
                         **extra_text_kw,
+                        **extra_image_kw,
                         **clean_kw,
                     )
                     accum[gen_name]["outcome"].append(float(objs[0]))
@@ -492,6 +579,7 @@ def _run_ablation_combo(
     try:
         with _limit_worker_threads(worker_threads_limit):
             generators = _build_generators_for_combo(
+                dataset=dataset,
                 k=k,
                 tab_metrics_by_name=tab_cfg,
                 ts_metrics_by_name=ts_cfg,
@@ -655,11 +743,10 @@ def run_distance_ablation(
     if len(sample_indices) == 0:
         raise ValueError("No sample indices provided for ablation.")
 
-    has_static = dataset.X_train_static is not None
-    tab_names = (["__primary__"] if has_static else []) + sorted(list((dataset.X_train_tab or {}).keys()))
-    ts_names = sorted(list((dataset.X_train_ts or {}).keys()))
-    has_text = dataset.X_train_text is not None and dataset.X_test_text is not None
-    has_image = dataset.X_train_img is not None and dataset.X_test_img is not None
+    tab_names = list(dataset.tabular_names(include_primary=True))
+    ts_names = sorted(dataset.ts_names())
+    has_text = bool(dataset.text_names()) and bool(dataset.text_modalities(split="test"))
+    has_image = bool(dataset.image_names()) and bool(dataset.image_modalities(split="test"))
 
     tab_assignments: List[Dict[str, str]] = []
     if len(tab_names) == 0:
