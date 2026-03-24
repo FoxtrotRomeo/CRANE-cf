@@ -270,6 +270,12 @@ When present, `TextNN` and downstream multimodal generators reuse those
 precomputed matrices instead of re-embedding the full train/test text corpus
 for every sample or combo.
 
+The runner also builds string→vector lookup tables from those precomputed
+embeddings once before the combo loop. Each combo's `embed_fn` (used during
+objective evaluation) is automatically wrapped to serve vectors from the lookup
+with the live callable as a fallback for cache misses. This eliminates GPU
+inference during the parallel objective-evaluation phase.
+
 Factories may also set:
 
 - `text_backend_kwargs["auto_text_branch_generators"] = False`
