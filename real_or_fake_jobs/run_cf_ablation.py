@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import Dict, Optional
@@ -185,19 +186,34 @@ def _tfidf_embed_fn(texts):
     return _tfidf_vec.transform(texts).toarray().astype(np.float32)
 
 
+# — tabular LOF (pre-fitted once; reused across all combos/candidates) —
+# tabular_plausibility() fits a fresh LOF on the full training set per call,
+# which takes ~1.5 s × 12 000 candidates/combo → hours of wall time.
+# Pre-fitting once and passing via plausibility_normalizer replaces this with
+# a cheap score_samples() lookup (read-only, thread-safe).
+print("Pre-fitting tabular LOF on training set …")
+from sklearn.neighbors import LocalOutlierFactor as _LOF
+_n_lof_neighbors = max(2, min(20, len(dataset.X_train_static) - 1))
+_tab_lof = _LOF(n_neighbors=_n_lof_neighbors, novelty=True)
+_tab_lof.fit(dataset.X_train_static)
+_tab_lof_train_scores = -_tab_lof.score_samples(dataset.X_train_static)
+_tab_lof_low  = float(np.percentile(_tab_lof_train_scores, 5))
+_tab_lof_high = float(np.percentile(_tab_lof_train_scores, 95))
+print(f"  LOF fitted on {len(dataset.X_train_static):,} samples "
+      f"(score range [{_tab_lof_low:.3f}, {_tab_lof_high:.3f}])")
+
+
 # ---------------------------------------------------------------------------
 # BERT embed_fn (when not --no-bert)
 # ---------------------------------------------------------------------------
 _bert_embed_fn: Optional[object] = None
 if not args.no_bert:
-    from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK, _make_embed_fn_from_e5_kwargs
+    from counterfactual_evaluation_helpers import _make_embed_fn_from_e5_kwargs
     _bert_embed_fn = _make_embed_fn_from_e5_kwargs(
         tokenizer = text_bk["bert_tokenizer"],
         model     = text_bk["bert_model"],
         device    = text_bk["bert_device"],
     )
-else:
-    from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
 
 # ---------------------------------------------------------------------------
 # word2vec (optional)
@@ -271,6 +287,22 @@ for enc_name, _ in _encoder_embed_fns:
         )
         for split in ("train", "test")
     }
+
+# Build per-field text-string → precomputed-vector lookup tables.
+# Both train and test strings are indexed so embed_fn calls in objective
+# evaluation hit the cache without any GPU inference during the parallel phase.
+_field_emb_lookup: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {
+    fname: {
+        enc_name: {
+            **{str(t): v
+               for t, v in zip(ftrain, _precomputed_by_field[fname][enc_name]["train"])},
+            **{str(t): v
+               for t, v in zip(ftest,  _precomputed_by_field[fname][enc_name]["test"])},
+        }
+        for enc_name, _ in _encoder_embed_fns
+    }
+    for fname, ftrain, ftest in zip(_FIELD_NAMES, _FIELD_TRAINS, _FIELD_TESTS)
+}
 
 # Expose description precomputed embeddings to the base TextNN via text_bk
 text_bk["precomputed_text_embeddings_by_encoder"] = {
@@ -754,6 +786,7 @@ def _compute_torch_latents(torch_model, tokenizer, device, batch_size=16):
 # ---------------------------------------------------------------------------
 _torch_latents: Optional[tuple] = None
 _predict_fn:    Optional[object] = None
+_predict_fn_lock = threading.Lock()  # serializes live GPU inference (cache-miss path)
 _DATA_DIR = Path(__file__).parent / "data"
 _pt_path  = _DATA_DIR / "best_model.pt"
 
@@ -841,10 +874,54 @@ if _pt_path.exists():
             _torch_model, _latent_tokenizer, _device_latent
         )
 
+        # Precompute model predictions for all training samples in one batched pass.
+        # Unimodal / Combined / EarlyFusion / IntermediateFusion candidates are pure
+        # training samples — exact cache hits.  Only MultiFieldFrankensteinNN assembles
+        # hybrids (tabular median + texts from three independent branches), so those
+        # miss the cache and fall through to serialized live inference.
+        print("Precomputing model predictions for all training samples …")
+        _n_tr = len(dataset.X_train_static)
+        _pred_rows = []
+        for _bs in range(0, _n_tr, 16):
+            _be = min(_bs + 16, _n_tr)
+            _descs    = [str(t) for t in X_train_description[_bs:_be]]
+            _profiles = [str(t) for t in X_train_company_profile[_bs:_be]]
+            _reqs_    = [str(t) for t in X_train_requirements[_bs:_be]]
+            _enc_d = _latent_tokenizer(_descs,    max_length=512, padding="max_length",
+                                       truncation=True, return_tensors="pt")
+            _enc_p = _latent_tokenizer(_profiles, max_length=512, padding="max_length",
+                                       truncation=True, return_tensors="pt")
+            _enc_r = _latent_tokenizer(_reqs_,    max_length=512, padding="max_length",
+                                       truncation=True, return_tensors="pt")
+            _ptab = torch.tensor(
+                dataset.X_train_static[_bs:_be].astype(np.float32), dtype=torch.float32,
+            ).to(_device_latent)
+            with torch.no_grad():
+                _plogits = _torch_model(
+                    _enc_d["input_ids"].to(_device_latent), _enc_d["attention_mask"].to(_device_latent),
+                    _enc_p["input_ids"].to(_device_latent), _enc_p["attention_mask"].to(_device_latent),
+                    _enc_r["input_ids"].to(_device_latent), _enc_r["attention_mask"].to(_device_latent),
+                    _ptab,
+                )
+            _pred_rows.append(_plogits.argmax(dim=-1).cpu().numpy().astype(np.float32))
+        _train_pred_arr = np.concatenate(_pred_rows)
+        _train_pred_cache: dict = {
+            (
+                dataset.X_train_static[_i].astype(np.float32).tobytes(),
+                str(X_train_description[_i]),
+                str(X_train_company_profile[_i]),
+                str(X_train_requirements[_i]),
+            ): float(_train_pred_arr[_i])
+            for _i in range(_n_tr)
+        }
+        print(f"  Cached {len(_train_pred_cache):,} training-sample predictions.")
+
         def _predict_fn(x_tab_or_dict, x_ts, text_candidate_or_dict,
                         _model=_torch_model,
                         _tok=_latent_tokenizer,
-                        _dev=_device_latent):
+                        _dev=_device_latent,
+                        _cache=_train_pred_cache,
+                        _lock=_predict_fn_lock):
             import torch as _t
 
             # Multi-instance path: called when text_modalities has > 1 entry
@@ -863,13 +940,21 @@ if _pt_path.exists():
                 desc, profile, reqs = _desc_to_fields.get(text, (text, "", ""))
                 x_tab   = x_tab_or_dict
 
+            # Fast path: cache hit (pure training-sample candidates).
+            if x_tab is not None:
+                _key = (np.asarray(x_tab, dtype=np.float32).tobytes(), desc, profile, reqs)
+                _hit = _cache.get(_key)
+                if _hit is not None:
+                    return _hit
+
+            # Cache miss: Frankenstein hybrid — serialized live inference.
             def _enc(t):
                 return _tok([t], max_length=512, padding="max_length",
                             truncation=True, return_tensors="pt")
 
             tab = _t.tensor(np.asarray(x_tab, dtype=np.float32)[None, :],
                             dtype=_t.float32).to(_dev)
-            with _HF_BACKEND_LOCK:
+            with _lock:
                 enc_d = _enc(desc)
                 enc_p = _enc(profile)
                 enc_r = _enc(reqs)
@@ -899,6 +984,34 @@ def _get_embed_fn_for_encoder(encoder: str):
     return _tfidf_embed_fn
 
 
+def _make_field_lookup_embed_fn(field_name: str, encoder: str):
+    """Return an embed_fn for *field_name* backed by ``_field_emb_lookup``.
+
+    All training and test texts for every field are precomputed, so the live
+    fallback path is never exercised during normal runs.
+    """
+    lookup  = _field_emb_lookup.get(field_name, {}).get(encoder, {})
+    live_fn = _get_embed_fn_for_encoder(encoder)
+
+    def _fn(texts, _lk=lookup, _live=live_fn):
+        vecs = [None] * len(texts)
+        miss_pos, miss_txt = [], []
+        for i, t in enumerate(texts):
+            v = _lk.get(str(t) if t is not None else "")
+            if v is not None:
+                vecs[i] = v
+            else:
+                miss_pos.append(i)
+                miss_txt.append(str(t) if t is not None else "")
+        if miss_txt:
+            live_embs = np.asarray(_live(miss_txt), dtype=np.float32)
+            for j, pos in enumerate(miss_pos):
+                vecs[pos] = live_embs[j]
+        return np.stack(vecs)
+
+    return _fn
+
+
 def _get_field_precomputed(field_name: str, encoder: str) -> Optional[Dict[str, np.ndarray]]:
     """Return cached {train, test} embeddings for the given field and encoder."""
     return (
@@ -925,9 +1038,11 @@ def _metric_to_static_dist_fn(metric: str):
 # Per-combo objectives factory
 # ---------------------------------------------------------------------------
 def _objectives_kwargs_factory(text_cfg, image_cfg):
-    encoder  = (text_cfg or {}).get("encoder", "raw")
-    embed_fn = _get_embed_fn_for_encoder(encoder)
-    ctx = {"embed_fn": embed_fn}
+    encoder     = (text_cfg or {}).get("encoder", "raw")
+    obj_encoder = "tfidf" if encoder == "raw" else encoder
+    desc_ctx    = {"embed_fn": _make_field_lookup_embed_fn("description",    obj_encoder)}
+    profile_ctx = {"embed_fn": _make_field_lookup_embed_fn("company_profile", obj_encoder)}
+    reqs_ctx    = {"embed_fn": _make_field_lookup_embed_fn("requirements",   obj_encoder)}
 
     # Cache per-field test/train arrays as numpy object arrays for fast indexing.
     _Xtest_desc    = np.asarray(X_test_description,     dtype=object).reshape(-1)
@@ -965,14 +1080,19 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
         fact_reqs    = str(_Xtest_reqs[sample_idx])    if sample_idx < len(_Xtest_reqs)    else ""
 
         return {"text_modalities": {
-            "description":     {"candidate": cand_desc,    "factual": fact_desc,    "context": ctx},
-            "company_profile": {"candidate": cand_profile, "factual": fact_profile, "context": ctx},
-            "requirements":    {"candidate": cand_reqs,    "factual": fact_reqs,    "context": ctx},
+            "description":     {"candidate": cand_desc,    "factual": fact_desc,    "context": desc_ctx},
+            "company_profile": {"candidate": cand_profile, "factual": fact_profile, "context": profile_ctx},
+            "requirements":    {"candidate": cand_reqs,    "factual": fact_reqs,    "context": reqs_ctx},
         }}
 
     kwargs: dict = {
         "y_target": target_value,
         "_text_modalities_fn": _text_modalities_fn,
+        "plausibility_normalizer": {
+            "tab_lof":  _tab_lof,
+            "tab_low":  _tab_lof_low,
+            "tab_high": _tab_lof_high,
+        },
     }
     if _predict_fn is not None:
         kwargs["predict_fn"] = _predict_fn

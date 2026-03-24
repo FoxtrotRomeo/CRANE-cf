@@ -22,8 +22,8 @@ Run
     python run_cf_ablation.py --gpu 7 --max-samples 3 --no-bert \\
         --italian-ft-path data/cc.it.300.bin --word2vec-path data/glove_twitter_25.kv
 
-    # Without word2vec
-    python run_cf_ablation.py --gpu 7 --max-samples 3 --no-bert
+    # Without word2vec or fastText
+    python run_cf_ablation.py --gpu 7 --max-samples 3 --no-bert --no-italian-ft
 
 Outputs
 -------
@@ -37,7 +37,8 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
+import threading
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -62,14 +63,14 @@ from counterfactual_helpers import find_k_closest_latent
 parser = argparse.ArgumentParser(
     description="Sadness→Joy counterfactual ablation on Long COVID tweets."
 )
-parser.add_argument("--gpu",              type=int,   default=None)
+parser.add_argument("--gpu",              type=int,   default=7)
 parser.add_argument("--k",               type=int,   default=20,
                     help="Number of nearest neighbours per generator (default: 20).")
-parser.add_argument("--max-samples",     type=int,   default=None,
+parser.add_argument("--max-samples",     type=int,   default=100,
                     help="Cap on how many sadness samples to process (default: all).")
 parser.add_argument("--max-combinations",type=int,   default=None,
                     help="Cap on metric combinations to try (default: all).")
-parser.add_argument("--n-jobs",          type=int,   default=1,
+parser.add_argument("--n-jobs",          type=int,   default=4,
                     help="Number of ablation combinations to run in parallel.")
 parser.add_argument("--output-dir",      type=str,   default="data/ablation_runs")
 parser.add_argument("--run-name",        type=str,   default=None)
@@ -80,9 +81,11 @@ parser.add_argument("--no-bert",         action="store_true",
 parser.add_argument("--word2vec-path",   type=str,   default=None,
                     help="Path to a gensim word2vec .bin or .kv file. "
                          "Enables word2vec as a search and evaluation encoder.")
-parser.add_argument("--italian-ft-path", type=str,   default=None,
+parser.add_argument("--italian-ft-path", type=str,   default="data/cc.it.300.bin",
                     help="Path to a fastText .bin model (e.g. cc.it.300.bin). "
                          "Used as 'custom' encoder for both NN search and objectives.")
+parser.add_argument("--no-italian-ft",   action="store_true",
+                    help="Skip loading the Italian fastText model even if --italian-ft-path exists.")
 parser.add_argument("--source-emotion",  type=str,   default="sadness",
                     help="Emotion class to explain (default: sadness).")
 parser.add_argument("--target-emotion",  type=str,   default="joy",
@@ -162,6 +165,22 @@ _tfidf_vec.fit(train_texts)
 def _tfidf_embed_fn(texts):
     # Raw TF-IDF vectors — the search pipeline normalises for cosine only.
     return _tfidf_vec.transform(texts).toarray().astype(np.float32)
+
+# — tabular LOF (pre-fitted once; reused across all combos/candidates) —
+# tabular_plausibility() fits a fresh LOF on the full training set per call,
+# which takes ~1.5 s × 12 000 candidates/combo → hours of wall time.
+# Pre-fitting once and passing via plausibility_normalizer reduces this to a
+# cheap score_samples() lookup (read-only, thread-safe).
+print("Pre-fitting tabular LOF on training set …")
+from sklearn.neighbors import LocalOutlierFactor as _LOF
+_n_lof_neighbors = max(2, min(20, len(dataset.X_train_static) - 1))
+_tab_lof = _LOF(n_neighbors=_n_lof_neighbors, novelty=True)
+_tab_lof.fit(dataset.X_train_static)
+_tab_lof_train_scores = -_tab_lof.score_samples(dataset.X_train_static)
+_tab_lof_low  = float(np.percentile(_tab_lof_train_scores, 5))
+_tab_lof_high = float(np.percentile(_tab_lof_train_scores, 95))
+print(f"  LOF fitted on {len(dataset.X_train_static):,} samples "
+      f"(score range [{_tab_lof_low:.3f}, {_tab_lof_high:.3f}])")
 
 # ---------------------------------------------------------------------------
 # PyTorch model latent space (for IntermediateFusion generator)
@@ -246,6 +265,7 @@ def _compute_torch_latents(torch_model, dataset, tokenizer, device, batch_size=3
 # Load the PyTorch classifier and precompute latents (once, reused across all combos)
 _torch_latents: Optional[tuple] = None
 _predict_fn: Optional[object] = None
+_predict_fn_lock = threading.Lock()  # serializes live GPU inference (cache-miss path)
 _DATA_DIR = Path(__file__).parent / "data"
 _pt_path  = _DATA_DIR / "best_model.pt"
 
@@ -313,14 +333,58 @@ if _pt_path.exists():
             _torch_model, dataset, _latent_tokenizer, _device_latent
         )
 
+        # Precompute model predictions for all training samples in one batched pass.
+        # Unimodal / Combined / EarlyFusion / IntermediateFusion candidates are pure
+        # training samples, so their predictions are exact cache hits.  Only
+        # FrankensteinNN assembles hybrids (tabular from one training sample, text
+        # from another), so those candidates will miss and fall through to serialized
+        # live inference.
+        print("Precomputing model predictions for all training samples …")
+        _n_tr = len(dataset.X_train_static)
+        _pred_rows = []
+        for _bs in range(0, _n_tr, 64):
+            _be = min(_bs + 64, _n_tr)
+            _ptexts = [str(t) for t in dataset.X_train_text[_bs:_be]]
+            _penc = _latent_tokenizer(
+                _ptexts, max_length=128, padding="max_length",
+                truncation=True, return_tensors="pt",
+            )
+            _ptab = torch.tensor(
+                dataset.X_train_static[_bs:_be].astype(np.float32),
+                dtype=torch.float32,
+            ).to(_device_latent)
+            with torch.no_grad():
+                _plogits = _torch_model(
+                    _penc["input_ids"].to(_device_latent),
+                    _penc["attention_mask"].to(_device_latent),
+                    _ptab,
+                )
+            _pred_rows.append(_plogits.argmax(dim=-1).cpu().numpy().astype(np.float32))
+        _train_pred_cache: dict = {
+            (dataset.X_train_static[_i].astype(np.float32).tobytes(),
+             str(dataset.X_train_text[_i])): float(np.concatenate(_pred_rows)[_i])
+            for _i in range(_n_tr)
+        }
+        print(f"  Cached {len(_train_pred_cache):,} training-sample predictions.")
+
         # Build predict_fn for outcome evaluation.
         # Returns the predicted class index (float) so outcome_objective = 0.0
         # when the counterfactual is classified as the target class.
+        # Fast path: cache lookup (no GPU call).
+        # Slow path: serialized live inference for Frankenstein / Combined hybrids.
         def _predict_fn(x_tab, x_ts, text_candidate,
-                        _model=_torch_model, _tok=_latent_tokenizer, _dev=_device_latent):
+                        _model=_torch_model, _tok=_latent_tokenizer, _dev=_device_latent,
+                        _cache=_train_pred_cache, _lock=_predict_fn_lock):
+            if x_tab is not None:
+                _key = (np.asarray(x_tab, dtype=np.float32).tobytes(),
+                        str(text_candidate) if text_candidate is not None else "")
+                _hit = _cache.get(_key)
+                if _hit is not None:
+                    return _hit
+            # Cache miss: Frankenstein / Combined hybrid — serialized live inference.
             import torch as _t
             text = str(text_candidate) if text_candidate is not None else ""
-            with _HF_BACKEND_LOCK:
+            with _lock:
                 enc = _tok([text], max_length=128, padding="max_length",
                            truncation=True, return_tensors="pt")
                 tab = _t.tensor(np.asarray(x_tab, dtype=np.float32)[None, :],
@@ -337,7 +401,7 @@ else:
 
 # — Italian fastText (optional, "custom" encoder slot) —
 _italian_ft_embed_fn: Optional[object] = None
-if args.italian_ft_path is not None:
+if args.italian_ft_path is not None and not args.no_italian_ft:
     ft_path = Path(args.italian_ft_path)
     if not ft_path.exists():
         raise FileNotFoundError(f"Italian fastText model not found: {ft_path}")
@@ -494,24 +558,24 @@ def _metric_to_static_dist_fn(metric: str):
 # Per-combo objectives factory
 # encoder used for search → same encoder for evaluation;
 # "raw" search → tfidf for evaluation.
+# The runner (run_distance_ablation) automatically wraps the returned embed_fn
+# with a lookup-backed version using precomputed_text_embeddings_by_encoder,
+# so no GPU embed calls occur during the parallel phase.
 # ---------------------------------------------------------------------------
 def _objectives_kwargs_factory(text_cfg, image_cfg):
     """Return compute_objectives kwargs matched to this combo's text encoder."""
     encoder = (text_cfg or {}).get("encoder", "raw")
-
-    if encoder == "bert" and _bert_embed_fn is not None:
-        embed_fn = _bert_embed_fn
-    elif encoder == "custom" and _italian_ft_embed_fn is not None:
-        embed_fn = _italian_ft_embed_fn
-    elif encoder == "word2vec" and _w2v_embed_fn is not None:
-        embed_fn = _w2v_embed_fn
-    else:
-        # tfidf or raw → use tfidf for objectives
-        embed_fn = _tfidf_embed_fn
-
+    # "raw" has no embedding space → tfidf for objectives
+    obj_encoder = "tfidf" if encoder == "raw" else encoder
+    embed_fn = _get_embed_fn_for_encoder(obj_encoder)
     kwargs = {
         "text_objective_context": {"embed_fn": embed_fn},
         "y_target": joy_value,
+        "plausibility_normalizer": {
+            "tab_lof":  _tab_lof,
+            "tab_low":  _tab_lof_low,
+            "tab_high": _tab_lof_high,
+        },
     }
     if _predict_fn is not None:
         kwargs["predict_fn"] = _predict_fn
