@@ -385,6 +385,97 @@ def _build_generators_for_combo(
     return generators
 
 
+def _build_text_embedding_lookup(
+    precomputed_by_encoder: Dict[str, Any],
+    dataset,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Build ``{encoder: {text_string: vector}}`` lookup tables from precomputed embeddings.
+
+    Covers the primary text branch.  Handles both the flat
+    ``{encoder: {"train": arr, "test": arr}}`` format and the named-branch
+    ``{branch_name: {encoder: {"train": arr, "test": arr}}}`` format.
+    Returns an empty dict when ``precomputed_by_encoder`` is empty.
+    """
+    if not precomputed_by_encoder:
+        return {}
+
+    # Detect format by inspecting the first value
+    first_val = next(iter(precomputed_by_encoder.values()), None)
+    if isinstance(first_val, dict) and "train" in first_val:
+        enc_splits = precomputed_by_encoder          # flat {enc: splits}
+    else:
+        primary = getattr(dataset, "primary_text_name", "__primary__")
+        enc_splits = precomputed_by_encoder.get(primary, {})  # named-branch: pick primary
+
+    _tt = dataset.get_text_branch(dataset.primary_text_name, split="train")
+    train_texts = _tt if _tt is not None else []
+    _ts = dataset.get_text_branch(dataset.primary_text_name, split="test")
+    test_texts  = _ts if _ts is not None else []
+
+    lookup: Dict[str, Dict[str, np.ndarray]] = {}
+    for enc, splits in enc_splits.items():
+        if not isinstance(splits, dict):
+            continue
+        lk: Dict[str, np.ndarray] = {}
+        train_arr = splits.get("train")
+        test_arr  = splits.get("test")
+        if train_arr is not None:
+            for t, v in zip(train_texts, train_arr):
+                lk[str(t) if t is not None else ""] = v
+        if test_arr is not None:
+            for t, v in zip(test_texts, test_arr):
+                lk.setdefault(str(t) if t is not None else "", v)
+        lookup[enc] = lk
+    return lookup
+
+
+def _wrap_embed_fn_with_lookup(
+    objectives_kwargs: Dict[str, Any],
+    text_cfg: Optional[Dict[str, Any]],
+    text_emb_lookup: Dict[str, Dict[str, np.ndarray]],
+) -> Dict[str, Any]:
+    """Return a copy of *objectives_kwargs* whose ``text_objective_context.embed_fn``
+    is backed by ``text_emb_lookup``, with the original live fn as fallback.
+
+    No-ops when the lookup is empty, the encoder is not in the lookup, or
+    ``text_objective_context`` / ``embed_fn`` are absent.
+    """
+    if not text_emb_lookup:
+        return objectives_kwargs
+    ctx = (objectives_kwargs or {}).get("text_objective_context")
+    if not ctx or "embed_fn" not in ctx:
+        return objectives_kwargs
+
+    encoder = (text_cfg or {}).get("encoder", "raw")
+    lookup_enc = "tfidf" if encoder == "raw" else encoder
+    lookup = text_emb_lookup.get(lookup_enc)
+    if not lookup:
+        return objectives_kwargs
+
+    live_fn = ctx["embed_fn"]
+
+    def _lookup_fn(texts, _lk=lookup, _live=live_fn):
+        vecs = [None] * len(texts)
+        miss_pos: List[int] = []
+        miss_txt: List[str] = []
+        for i, t in enumerate(texts):
+            v = _lk.get(str(t) if t is not None else "")
+            if v is not None:
+                vecs[i] = v
+            else:
+                miss_pos.append(i)
+                miss_txt.append(str(t) if t is not None else "")
+        if miss_txt:
+            live_embs = np.asarray(_live(miss_txt), dtype=np.float32)
+            for j, pos in enumerate(miss_pos):
+                vecs[pos] = live_embs[j]
+        return np.stack(vecs)
+
+    result = dict(objectives_kwargs)
+    result["text_objective_context"] = {**ctx, "embed_fn": _lookup_fn}
+    return result
+
+
 def _evaluate_combo_objectives(
     results_by_sample: Dict[int, Dict[str, Any]],
     dataset,
@@ -553,6 +644,7 @@ def _run_ablation_combo(
     objectives_kwargs_factory: Optional[Any],
     extra_generators_factory: Optional[Any],
     worker_threads_limit: Optional[int] = None,
+    text_embedding_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
     row = {
         "combo_id": combo_id,
@@ -622,6 +714,11 @@ def _run_ablation_combo(
                 )
             if combo_objectives_kwargs is None:
                 combo_objectives_kwargs = objectives_kwargs
+
+            if combo_objectives_kwargs is not None and text_embedding_lookup:
+                combo_objectives_kwargs = _wrap_embed_fn_with_lookup(
+                    combo_objectives_kwargs, text_cfg, text_embedding_lookup
+                )
 
             if combo_objectives_kwargs is not None and results:
                 try:
@@ -782,6 +879,13 @@ def run_distance_ablation(
     if max_combinations is not None and int(max_combinations) > 0:
         combo_iter = itertools.islice(combo_iter, int(max_combinations))
 
+    # Build lookup tables once; each combo worker reuses them to avoid GPU
+    # embed_fn calls during objective evaluation.
+    text_embedding_lookup = _build_text_embedding_lookup(
+        text_backend_kwargs.get("precomputed_text_embeddings_by_encoder") or {},
+        dataset,
+    )
+
     rows = []
     started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     n_jobs = max(1, int(n_jobs))
@@ -843,7 +947,8 @@ def run_distance_ablation(
             objectives_kwargs=objectives_kwargs,
             objectives_kwargs_factory=objectives_kwargs_factory,
             extra_generators_factory=extra_generators_factory,
-            worker_threads_limit=worker_threads_limit,
+            worker_threads_limit=None,  # limit applied once in main thread for n_jobs>1
+            text_embedding_lookup=text_embedding_lookup,
         )
 
     combo_enumerator = enumerate(combo_iter, start=1)
@@ -869,11 +974,13 @@ def run_distance_ablation(
                 objectives_kwargs_factory=objectives_kwargs_factory,
                 extra_generators_factory=extra_generators_factory,
                 worker_threads_limit=worker_threads_limit,
+                text_embedding_lookup=text_embedding_lookup,
             )
             _persist_combo_output(row, results)
     else:
         print(f"[ablation] Running up to {n_jobs} combos in parallel.")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
+        with _limit_worker_threads(worker_threads_limit), \
+             concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
             in_flight: Dict[concurrent.futures.Future, str] = {}
 
             for _ in range(n_jobs):
