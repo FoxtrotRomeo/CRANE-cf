@@ -70,7 +70,7 @@ parser.add_argument("--max-samples",     type=int,   default=100,
                     help="Cap on how many sadness samples to process (default: all).")
 parser.add_argument("--max-combinations",type=int,   default=None,
                     help="Cap on metric combinations to try (default: all).")
-parser.add_argument("--n-jobs",          type=int,   default=4,
+parser.add_argument("--n-jobs",          type=int,   default=1,
                     help="Number of ablation combinations to run in parallel.")
 parser.add_argument("--output-dir",      type=str,   default="data/ablation_runs")
 parser.add_argument("--run-name",        type=str,   default=None)

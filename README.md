@@ -93,8 +93,8 @@ results = lib.generate(dataset, sample_idx=3, target_value=0)
 | `TimeSeriesNN` | Nearest neighbours in a named time-series space (DTW / Euclidean / LCSS) |
 | `LabsNN` | Alias for `TimeSeriesNN("labs")` |
 | `MedsNN` | Alias for `TimeSeriesNN("meds")` |
-| `TextNN` | Nearest neighbours in a named text branch (`text_name`) using E5, BERT, TF-IDF, Word2Vec, BLEU, ROUGE, etc. |
-| `ImageNN` | Nearest neighbours in a named image branch (`image_name`) using ResNet-50, EfficientNet-B0, CLIP ViT-B/32, or pre-computed embeddings |
+| `TextNN` | Nearest neighbours in a named text branch (`text_name`) using E5, BERT, MiniLM, TF-IDF, Word2Vec, BLEU, ROUGE, etc. |
+| `ImageNN` | Nearest neighbours in a named image branch (`image_name`) using ResNet-50, EfficientNet-B0, ViT-B/16, CLIP ViT-B/32, or pre-computed embeddings |
 
 ### Multimodal
 
@@ -270,6 +270,15 @@ When present, `TextNN` and downstream multimodal generators reuse those
 precomputed matrices instead of re-embedding the full train/test text corpus
 for every sample or combo.
 
+Before the combo loop, the runner also precomputes all unique unimodal NN
+searches via `_prepare_unimodal_search_cache`. For each distinct
+`(modality, metric/encoder)` signature, the neighbor indices, distances, and
+materialized candidate dicts are computed once for the full sample batch and
+stored. Each combo receives only the relevant entries as a `precomputed_seed`
+passed to `CounterfactualLibrary`, so combos that share a tabular metric or
+text encoder never repeat that search. This is on by default and can be
+disabled with `--no-precompute-unimodal-searches`.
+
 The runner also builds string→vector lookup tables from those precomputed
 embeddings once before the combo loop. Each combo's `embed_fn` (used during
 objective evaluation) is automatically wrapped to serve vectors from the lookup
@@ -296,7 +305,7 @@ image generators when a project provides custom branch-aware generators.
 | `transformers` + `torch` | E5 / BERT text encoders *(optional)* |
 | `gensim` | Word2Vec text encoder *(optional)* |
 | `rouge-score` + `nltk` | ROUGE / BLEU text distance metrics *(optional)* |
-| `torch` + `torchvision` + `Pillow` | Image encoding with ResNet-50 / EfficientNet-B0 *(optional)* |
+| `torch` + `torchvision` + `Pillow` | Image encoding with ResNet-50 / EfficientNet-B0 / ViT-B/16 *(optional)* |
 | `clip` (OpenAI) | CLIP ViT-B/32 image encoder *(optional)* |
 | `keras` | Loading models for `IntermediateFusionNN` *(optional)* |
 
