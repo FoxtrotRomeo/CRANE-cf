@@ -600,6 +600,7 @@ def _normalize_text_encoder(text_encoder, default="e5") -> str:
         "w2v": "word2vec",
         "sbert": "bert",
         "sentence-bert": "bert",
+        "all-minilm-l6-v2": "minilm",
         "raw_text": "raw",
     }
     return aliases.get(enc, enc)
@@ -946,10 +947,13 @@ def _build_vision_encoder(backbone: str, device=None):
     elif backbone == "efficientnet_b0":
         model = tvm.efficientnet_b0(weights="IMAGENET1K_V1")
         model.classifier = torch.nn.Identity()
+    elif backbone == "vit_b_16":
+        model = tvm.vit_b_16(weights="IMAGENET1K_V1")
+        model.heads = torch.nn.Identity()
     else:
         raise ValueError(
             f"Unknown backbone '{backbone}'. "
-            "Supported: 'resnet50', 'efficientnet_b0', 'clip_vit_b32'."
+            "Supported: 'resnet50', 'efficientnet_b0', 'vit_b_16', 'clip_vit_b32'."
         )
 
     model = model.to(device_obj).eval()
@@ -989,7 +993,7 @@ def _build_image_representations(
     Parameters
     ----------
     image_encoder : ``"precomputed"`` | ``"resnet50"`` | ``"efficientnet_b0"``
-                    | ``"clip_vit_b32"`` | ``"custom"``
+                    | ``"vit_b_16"`` | ``"clip_vit_b32"`` | ``"custom"``
     embed_fn      : optional callable ``(images) -> np.ndarray (n, D)``.
                     When provided it takes precedence over ``image_encoder``.
     device        : torch device string (e.g. ``"cuda"`` or ``"cpu"``).
@@ -1013,11 +1017,11 @@ def _build_image_representations(
                 "Pre-computed image embeddings must be 2-D arrays (n_samples, D). "
                 f"Got shapes: train={emb_train.shape}, test={emb_test.shape}. "
                 "If these are raw images set image_encoder to 'resnet50', "
-                "'efficientnet_b0', 'clip_vit_b32', or 'custom' with embed_fn."
+                "'efficientnet_b0', 'vit_b_16', 'clip_vit_b32', or 'custom' with embed_fn."
             )
         return emb_train, emb_test
 
-    if enc in {"resnet50", "efficientnet_b0", "clip_vit_b32"}:
+    if enc in {"resnet50", "efficientnet_b0", "vit_b_16", "clip_vit_b32"}:
         encoder_fn = _build_vision_encoder(enc, device=device)
         emb_train = _apply_vision_encoder(X_train_img, encoder_fn, batch_size=batch_size)
         emb_test = _apply_vision_encoder(X_test_img, encoder_fn, batch_size=batch_size)
@@ -1025,7 +1029,7 @@ def _build_image_representations(
 
     raise ValueError(
         f"Unsupported image_encoder '{image_encoder}'. "
-        "Use one of {'precomputed', 'resnet50', 'efficientnet_b0', 'clip_vit_b32', 'custom'} "
+        "Use one of {'precomputed', 'resnet50', 'efficientnet_b0', 'vit_b_16', 'clip_vit_b32', 'custom'} "
         "or provide embed_fn."
     )
 
@@ -1229,6 +1233,14 @@ def _build_text_representations(
             )
         return emb_train, emb_test
 
+    if enc == "minilm":
+        embed_fn = text_embed_fn or e5_embed_fn
+        if embed_fn is None:
+            raise ValueError("MinILM encoding requires text_embed_fn.")
+        emb_train = np.asarray(embed_fn(train_texts_str), dtype=float)
+        emb_test = np.asarray(embed_fn(test_texts_str), dtype=float)
+        return emb_train, emb_test
+
     if enc in {"e5", "custom"}:
         embed_fn = text_embed_fn or e5_embed_fn
         if embed_fn is None and enc == "e5":
@@ -1256,7 +1268,7 @@ def _build_text_representations(
 
     raise ValueError(
         f"Unsupported text_encoder '{text_encoder}'. "
-        "Use one of {'e5', 'bert', 'tfidf', 'word2vec', 'custom', 'raw'}."
+        "Use one of {'e5', 'bert', 'minilm', 'tfidf', 'word2vec', 'custom', 'raw'}."
     )
 
 
