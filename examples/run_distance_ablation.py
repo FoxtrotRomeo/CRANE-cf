@@ -205,6 +205,11 @@ def _text_encoder_available(encoder: str, text_backend_kwargs: Dict[str, Any]) -
             text_backend_kwargs.get("word2vec_embed_fn") is not None
             or text_backend_kwargs.get("word2vec_model") is not None
         )
+    if enc == "minilm":
+        return (
+            text_backend_kwargs.get("minilm_embed_fn") is not None
+            or text_backend_kwargs.get("text_embed_fn") is not None
+        )
     if enc == "custom":
         return text_backend_kwargs.get("text_embed_fn") is not None
     return False
@@ -216,7 +221,7 @@ def _image_encoder_available(encoder: str, image_backend_kwargs: Dict[str, Any])
         return True
     if enc == "custom":
         return image_backend_kwargs.get("embed_fn") is not None
-    if enc in {"resnet50", "efficientnet_b0"}:
+    if enc in {"resnet50", "efficientnet_b0", "vit_b_16"}:
         try:
             import torch  # noqa: F401
             import torchvision  # noqa: F401
@@ -294,6 +299,75 @@ def _build_image_configs(
     return configs
 
 
+def _text_branch_names_for_ablation(dataset, text_backend_kwargs: Dict[str, Any]) -> List[str]:
+    auto_text_branches = bool(text_backend_kwargs.get("auto_text_branch_generators", True))
+    if auto_text_branches:
+        return list(dataset.text_names())
+    return [dataset.primary_text_name] if dataset.primary_text_name is not None else []
+
+
+def _image_branch_names_for_ablation(dataset, image_backend_kwargs: Dict[str, Any]) -> List[str]:
+    auto_image_branches = bool(image_backend_kwargs.get("auto_image_branch_generators", True))
+    if auto_image_branches:
+        return list(dataset.image_names())
+    return [dataset.primary_image_name] if dataset.primary_image_name is not None else []
+
+
+def _build_text_generator_for_branch(
+    *,
+    dataset,
+    k: int,
+    text_name: str,
+    text_cfg: Dict[str, Any],
+    text_backend_kwargs: Dict[str, Any],
+):
+    text_kwargs = dict(
+        text_name=text_name,
+        k=k,
+        text_encoder=text_cfg["encoder"],
+        text_distance_metric=text_cfg["metric"],
+    )
+    text_kwargs.update(_filter_kwargs_for_callable(TextNN.__init__, text_backend_kwargs))
+    if (
+        str(text_cfg["encoder"]).strip().lower() == "minilm"
+        and text_backend_kwargs.get("minilm_embed_fn") is not None
+    ):
+        text_kwargs["text_embed_fn"] = text_backend_kwargs["minilm_embed_fn"]
+
+    precomputed_by_encoder = text_backend_kwargs.get("precomputed_text_embeddings_by_encoder")
+    if isinstance(precomputed_by_encoder, dict):
+        precomputed = precomputed_by_encoder.get(text_name)
+        if precomputed is None and text_name == dataset.primary_text_name:
+            precomputed = precomputed_by_encoder.get(text_cfg["encoder"])
+        elif isinstance(precomputed, dict):
+            precomputed = precomputed.get(text_cfg["encoder"])
+        if isinstance(precomputed, dict):
+            text_kwargs["precomputed_train_text_embeddings"] = precomputed.get("train")
+            text_kwargs["precomputed_test_text_embeddings"] = precomputed.get("test")
+
+    gen_name = "Text" if text_name == dataset.primary_text_name else f"Text[{text_name}]"
+    return gen_name, TextNN(**text_kwargs)
+
+
+def _build_image_generator_for_branch(
+    *,
+    dataset,
+    k: int,
+    image_name: str,
+    image_cfg: Dict[str, Any],
+    image_backend_kwargs: Dict[str, Any],
+):
+    image_kwargs = dict(
+        image_name=image_name,
+        k=k,
+        image_encoder=image_cfg["encoder"],
+        image_distance_metric=image_cfg["metric"],
+    )
+    image_kwargs.update(_filter_kwargs_for_callable(ImageNN.__init__, image_backend_kwargs))
+    gen_name = "Image" if image_name == dataset.primary_image_name else f"Image[{image_name}]"
+    return gen_name, ImageNN(**image_kwargs)
+
+
 def _build_generators_for_combo(
     *,
     dataset,
@@ -330,57 +404,29 @@ def _build_generators_for_combo(
 
     # Text modality (optional)
     if text_cfg is not None:
-        auto_text_branches = bool(text_backend_kwargs.get("auto_text_branch_generators", True))
-        if auto_text_branches:
-            text_branch_names = dataset.text_names()
-        else:
-            text_branch_names = (
-                [dataset.primary_text_name]
-                if dataset.primary_text_name is not None
-                else []
-            )
-        precomputed_by_encoder = text_backend_kwargs.get("precomputed_text_embeddings_by_encoder")
+        text_branch_names = _text_branch_names_for_ablation(dataset, text_backend_kwargs)
         for text_name in text_branch_names:
-            text_kwargs = dict(
-                text_name=text_name,
+            gen_name, gen = _build_text_generator_for_branch(
+                dataset=dataset,
                 k=k,
-                text_encoder=text_cfg["encoder"],
-                text_distance_metric=text_cfg["metric"],
+                text_name=text_name,
+                text_cfg=text_cfg,
+                text_backend_kwargs=text_backend_kwargs,
             )
-            text_kwargs.update(_filter_kwargs_for_callable(TextNN.__init__, text_backend_kwargs))
-            if isinstance(precomputed_by_encoder, dict):
-                precomputed = precomputed_by_encoder.get(text_name)
-                if precomputed is None and text_name == dataset.primary_text_name:
-                    precomputed = precomputed_by_encoder.get(text_cfg["encoder"])
-                elif isinstance(precomputed, dict):
-                    precomputed = precomputed.get(text_cfg["encoder"])
-                if isinstance(precomputed, dict):
-                    text_kwargs["precomputed_train_text_embeddings"] = precomputed.get("train")
-                    text_kwargs["precomputed_test_text_embeddings"] = precomputed.get("test")
-            gen_name = "Text" if text_name == dataset.primary_text_name else f"Text[{text_name}]"
-            generators[gen_name] = TextNN(**text_kwargs)
+            generators[gen_name] = gen
 
     # Image modality (optional)
     if image_cfg is not None:
-        auto_image_branches = bool(image_backend_kwargs.get("auto_image_branch_generators", True))
-        if auto_image_branches:
-            image_branch_names = dataset.image_names()
-        else:
-            image_branch_names = (
-                [dataset.primary_image_name]
-                if dataset.primary_image_name is not None
-                else []
-            )
+        image_branch_names = _image_branch_names_for_ablation(dataset, image_backend_kwargs)
         for image_name in image_branch_names:
-            image_kwargs = dict(
-                image_name=image_name,
+            gen_name, gen = _build_image_generator_for_branch(
+                dataset=dataset,
                 k=k,
-                image_encoder=image_cfg["encoder"],
-                image_distance_metric=image_cfg["metric"],
+                image_name=image_name,
+                image_cfg=image_cfg,
+                image_backend_kwargs=image_backend_kwargs,
             )
-            image_kwargs.update(_filter_kwargs_for_callable(ImageNN.__init__, image_backend_kwargs))
-            gen_name = "Image" if image_name == dataset.primary_image_name else f"Image[{image_name}]"
-            generators[gen_name] = ImageNN(**image_kwargs)
+            generators[gen_name] = gen
 
     return generators
 
@@ -474,6 +520,208 @@ def _wrap_embed_fn_with_lookup(
     result = dict(objectives_kwargs)
     result["text_objective_context"] = {**ctx, "embed_fn": _lookup_fn}
     return result
+
+
+def _prepare_unimodal_search_cache(
+    *,
+    dataset,
+    sample_indices: Sequence[int],
+    target_value: int,
+    k: int,
+    combo_args_list: Sequence[Tuple[Dict[str, str], Dict[str, Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]],
+    text_backend_kwargs: Dict[str, Any],
+    image_backend_kwargs: Dict[str, Any],
+) -> Dict[str, Dict[Any, Dict[str, Any]]]:
+    """Precompute unimodal NN searches once per unique modality config.
+
+    The returned cache stores, for each unique unimodal config, the neighbor
+    indices/distances and the already-materialized unimodal candidate dicts for
+    the selected sample batch. These cached results can then be reused across
+    ablation combos that differ only in the *other* modalities.
+    """
+    selected = [int(idx) for idx in sample_indices]
+    if not combo_args_list:
+        return {"tabular": {}, "ts": {}, "text": {}, "image": {}}
+
+    cache: Dict[str, Dict[Any, Dict[str, Any]]] = {
+        "tabular": {},
+        "ts": {},
+        "text": {},
+        "image": {},
+    }
+
+    needed_tab = set()
+    needed_ts = set()
+    needed_text = set()
+    needed_image = set()
+
+    text_branch_names = _text_branch_names_for_ablation(dataset, text_backend_kwargs)
+    image_branch_names = _image_branch_names_for_ablation(dataset, image_backend_kwargs)
+
+    for tab_cfg, ts_cfg, text_cfg, image_cfg in combo_args_list:
+        for tab_name, metric in (tab_cfg or {}).items():
+            needed_tab.add((tab_name, str(metric)))
+        for ts_name, cfg in (ts_cfg or {}).items():
+            needed_ts.add((ts_name, str(cfg.get("metric")), cfg.get("dtw_window")))
+        if text_cfg is not None:
+            text_sig = (
+                str(text_cfg.get("encoder")),
+                str(text_cfg.get("metric")),
+            )
+            for text_name in text_branch_names:
+                needed_text.add((text_name, *text_sig))
+        if image_cfg is not None:
+            image_sig = (
+                str(image_cfg.get("encoder")),
+                str(image_cfg.get("metric")),
+            )
+            for image_name in image_branch_names:
+                needed_image.add((image_name, *image_sig))
+
+    for tab_name, metric in sorted(needed_tab):
+        gen = (
+            TabularNN(k=k, distance_metric=metric)
+            if tab_name == dataset.primary_tabular_name
+            else TabularNN(tab_name=tab_name, k=k, distance_metric=metric)
+        )
+        print(f"[ablation] Precomputing tabular search: {tab_name} / {metric}")
+        cands, idx, dist = gen.generate_raw_batch(
+            dataset,
+            selected,
+            target_value=target_value,
+            k=k,
+        )
+        cache["tabular"][(tab_name, metric)] = {
+            "pc_key": "tabular" if tab_name == dataset.primary_tabular_name else tab_name,
+            "indices": idx,
+            "distances": dist,
+            "candidates": cands,
+        }
+
+    for ts_name, metric, dtw_window in sorted(needed_ts):
+        gen = TimeSeriesNN(
+            ts_name=ts_name,
+            k=k,
+            distance_metric=metric,
+            dtw_window=dtw_window,
+        )
+        label = f"{metric}" if dtw_window is None else f"{metric}(window={dtw_window})"
+        print(f"[ablation] Precomputing TS search: {ts_name} / {label}")
+        cands, idx, dist = gen.generate_raw_batch(
+            dataset,
+            selected,
+            target_value=target_value,
+            k=k,
+        )
+        cache["ts"][(ts_name, metric, dtw_window)] = {
+            "pc_key": ts_name,
+            "indices": idx,
+            "distances": dist,
+            "candidates": cands,
+        }
+
+    for text_name, encoder, metric in sorted(needed_text):
+        _, gen = _build_text_generator_for_branch(
+            dataset=dataset,
+            k=k,
+            text_name=text_name,
+            text_cfg={"encoder": encoder, "metric": metric},
+            text_backend_kwargs=text_backend_kwargs,
+        )
+        print(f"[ablation] Precomputing text search: {text_name} / {encoder} / {metric}")
+        cands, idx, dist, train_text_str = gen.generate_raw_batch(
+            dataset,
+            selected,
+            target_value=target_value,
+            k=k,
+        )
+        cache["text"][(text_name, encoder, metric)] = {
+            "pc_key": ("text", text_name),
+            "indices": idx,
+            "distances": dist,
+            "candidates": cands,
+            "train_text_str": train_text_str,
+        }
+
+    for image_name, encoder, metric in sorted(needed_image):
+        _, gen = _build_image_generator_for_branch(
+            dataset=dataset,
+            k=k,
+            image_name=image_name,
+            image_cfg={"encoder": encoder, "metric": metric},
+            image_backend_kwargs=image_backend_kwargs,
+        )
+        print(f"[ablation] Precomputing image search: {image_name} / {encoder} / {metric}")
+        cands, idx, dist = gen.generate_raw_batch(
+            dataset,
+            selected,
+            target_value=target_value,
+            k=k,
+        )
+        cache["image"][(image_name, encoder, metric)] = {
+            "pc_key": ("image", image_name),
+            "indices": idx,
+            "distances": dist,
+            "candidates": cands,
+        }
+
+    return cache
+
+
+def _assemble_combo_precomputed(
+    *,
+    dataset,
+    tab_cfg: Dict[str, str],
+    ts_cfg: Dict[str, Dict[str, Any]],
+    text_cfg: Optional[Dict[str, Any]],
+    image_cfg: Optional[Dict[str, Any]],
+    unimodal_search_cache: Dict[str, Dict[Any, Dict[str, Any]]],
+    text_backend_kwargs: Dict[str, Any],
+    image_backend_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    pc: Dict[str, Any] = {}
+    candidate_cache_by_key: Dict[Any, Dict[int, List[Dict[str, Any]]]] = {}
+
+    for tab_name, metric in (tab_cfg or {}).items():
+        entry = unimodal_search_cache.get("tabular", {}).get((tab_name, str(metric)))
+        if entry is None:
+            continue
+        pc[entry["pc_key"]] = (entry["indices"], entry["distances"])
+        candidate_cache_by_key[entry["pc_key"]] = entry["candidates"]
+
+    for ts_name, cfg in (ts_cfg or {}).items():
+        sig = (ts_name, str(cfg.get("metric")), cfg.get("dtw_window"))
+        entry = unimodal_search_cache.get("ts", {}).get(sig)
+        if entry is None:
+            continue
+        pc[entry["pc_key"]] = (entry["indices"], entry["distances"])
+        candidate_cache_by_key[entry["pc_key"]] = entry["candidates"]
+
+    if text_cfg is not None:
+        encoder = str(text_cfg.get("encoder"))
+        metric = str(text_cfg.get("metric"))
+        for text_name in _text_branch_names_for_ablation(dataset, text_backend_kwargs):
+            entry = unimodal_search_cache.get("text", {}).get((text_name, encoder, metric))
+            if entry is None:
+                continue
+            pc[entry["pc_key"]] = (entry["indices"], entry["distances"])
+            candidate_cache_by_key[entry["pc_key"]] = entry["candidates"]
+            if entry.get("train_text_str") is not None:
+                pc.setdefault("train_text_str", {})[text_name] = entry["train_text_str"]
+
+    if image_cfg is not None:
+        encoder = str(image_cfg.get("encoder"))
+        metric = str(image_cfg.get("metric"))
+        for image_name in _image_branch_names_for_ablation(dataset, image_backend_kwargs):
+            entry = unimodal_search_cache.get("image", {}).get((image_name, encoder, metric))
+            if entry is None:
+                continue
+            pc[entry["pc_key"]] = (entry["indices"], entry["distances"])
+            candidate_cache_by_key[entry["pc_key"]] = entry["candidates"]
+
+    if candidate_cache_by_key:
+        pc["_candidate_cache_by_key"] = candidate_cache_by_key
+    return pc
 
 
 def _evaluate_combo_objectives(
@@ -645,6 +893,7 @@ def _run_ablation_combo(
     extra_generators_factory: Optional[Any],
     worker_threads_limit: Optional[int] = None,
     text_embedding_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+    precomputed_seed: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
     row = {
         "combo_id": combo_id,
@@ -699,6 +948,7 @@ def _run_ablation_combo(
                 model=model,
                 target_value=target_value,
                 k=k,
+                precomputed_seed=precomputed_seed,
             )
 
             counts = _summarize_results(results)
@@ -763,6 +1013,7 @@ def run_distance_ablation(
     objectives_kwargs: Optional[Dict[str, Any]] = None,
     objectives_kwargs_factory: Optional[Any] = None,
     extra_generators_factory: Optional[Any] = None,
+    precompute_unimodal_searches: bool = True,
 ) -> Dict[str, Any]:
     """Run distance-combination ablation and return summary metadata.
 
@@ -776,8 +1027,9 @@ def run_distance_ablation(
         Used only when ``sample_indices`` is None.
     image_encoders
         List of image encoder names to sweep over: ``"precomputed"``,
-        ``"resnet50"``, ``"efficientnet_b0"``, ``"clip_vit_b32"``, or
-        ``"custom"``. Encoders whose dependencies are missing are skipped.
+        ``"resnet50"``, ``"efficientnet_b0"``, ``"vit_b_16"``,
+        ``"clip_vit_b32"``, or ``"custom"``. Encoders whose dependencies
+        are missing are skipped.
         Defaults to ``["precomputed"]``.
     image_distance_metrics
         Distance metrics for the image NN search (e.g. ``["cosine", "euclidean"]``).
@@ -813,6 +1065,10 @@ def run_distance_ablation(
         Called once per combo. The returned dict of ``{name: generator}``
         is merged into the combo's generator set alongside the standard
         unimodal generators. Return ``None`` or ``{}`` to add nothing.
+    precompute_unimodal_searches
+        When True (default), precompute unique unimodal NN searches once per
+        modality config across the selected combo set, and reuse them across
+        combos that differ only in other modalities.
     n_jobs
         Number of ablation combos to run concurrently. Values above 1 use a
         thread pool that shares the same dataset, model, and backend objects.
@@ -878,6 +1134,7 @@ def run_distance_ablation(
     combo_iter = itertools.product(tab_assignments, ts_assignments, text_configs, image_configs)
     if max_combinations is not None and int(max_combinations) > 0:
         combo_iter = itertools.islice(combo_iter, int(max_combinations))
+    combo_args_list = list(combo_iter)
 
     # Build lookup tables once; each combo worker reuses them to avoid GPU
     # embed_fn calls during objective evaluation.
@@ -885,6 +1142,19 @@ def run_distance_ablation(
         text_backend_kwargs.get("precomputed_text_embeddings_by_encoder") or {},
         dataset,
     )
+
+    unimodal_search_cache = {"tabular": {}, "ts": {}, "text": {}, "image": {}}
+    if precompute_unimodal_searches and combo_args_list:
+        print("[ablation] Precomputing reusable unimodal NN searches across combos.")
+        unimodal_search_cache = _prepare_unimodal_search_cache(
+            dataset=dataset,
+            sample_indices=sample_indices,
+            target_value=target_value,
+            k=k,
+            combo_args_list=combo_args_list,
+            text_backend_kwargs=text_backend_kwargs,
+            image_backend_kwargs=image_backend_kwargs,
+        )
 
     rows = []
     started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -949,9 +1219,19 @@ def run_distance_ablation(
             extra_generators_factory=extra_generators_factory,
             worker_threads_limit=None,  # limit applied once in main thread for n_jobs>1
             text_embedding_lookup=text_embedding_lookup,
+            precomputed_seed=_assemble_combo_precomputed(
+                dataset=dataset,
+                tab_cfg=tab_cfg,
+                ts_cfg=ts_cfg,
+                text_cfg=text_cfg,
+                image_cfg=image_cfg,
+                unimodal_search_cache=unimodal_search_cache,
+                text_backend_kwargs=text_backend_kwargs,
+                image_backend_kwargs=image_backend_kwargs,
+            ),
         )
 
-    combo_enumerator = enumerate(combo_iter, start=1)
+    combo_enumerator = enumerate(combo_args_list, start=1)
     if n_jobs == 1:
         for combo_idx, combo_args in combo_enumerator:
             combo_id = f"combo_{combo_idx:05d}"
@@ -975,6 +1255,16 @@ def run_distance_ablation(
                 extra_generators_factory=extra_generators_factory,
                 worker_threads_limit=worker_threads_limit,
                 text_embedding_lookup=text_embedding_lookup,
+                precomputed_seed=_assemble_combo_precomputed(
+                    dataset=dataset,
+                    tab_cfg=tab_cfg,
+                    ts_cfg=ts_cfg,
+                    text_cfg=text_cfg,
+                    image_cfg=image_cfg,
+                    unimodal_search_cache=unimodal_search_cache,
+                    text_backend_kwargs=text_backend_kwargs,
+                    image_backend_kwargs=image_backend_kwargs,
+                ),
             )
             _persist_combo_output(row, results)
     else:
@@ -1029,6 +1319,7 @@ def run_distance_ablation(
         "text_direct_metrics_space": text_direct_metrics,
         "image_encoders_space": image_encoders,
         "image_distance_metrics_space": image_distance_metrics,
+        "precompute_unimodal_searches": bool(precompute_unimodal_searches),
         "rows": rows,
     }
 
@@ -1078,13 +1369,18 @@ def parse_args():
         "--image-encoders",
         type=str,
         default="precomputed",
-        help="Comma-separated image encoders to sweep: precomputed,resnet50,efficientnet_b0,clip_vit_b32.",
+        help="Comma-separated image encoders to sweep: precomputed,resnet50,efficientnet_b0,vit_b_16,clip_vit_b32.",
     )
     p.add_argument(
         "--image-distance-metrics",
         type=str,
         default="cosine",
         help="Comma-separated distance metrics for image NN search (e.g. cosine,euclidean).",
+    )
+    p.add_argument(
+        "--no-precompute-unimodal-searches",
+        action="store_true",
+        help="Disable cross-combo caching of unimodal NN searches.",
     )
     return p.parse_args()
 
@@ -1149,6 +1445,7 @@ def main():
         save_full=bool(args.save_full),
         max_combinations=args.max_combinations,
         n_jobs=args.n_jobs,
+        precompute_unimodal_searches=not args.no_precompute_unimodal_searches,
     )
 
 

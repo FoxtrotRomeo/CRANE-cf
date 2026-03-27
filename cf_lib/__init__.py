@@ -92,12 +92,113 @@ class CounterfactualLibrary:
         self.generators = generators
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_precomputed_key(gen, dataset: MultimodalDataset):
+        if isinstance(gen, TimeSeriesNN):
+            return gen.ts_name
+        if isinstance(gen, TabularNN):
+            tab_name = dataset.resolve_tabular_branch_name(gen.tab_name)
+            return tab_name if tab_name != dataset.primary_tabular_name else "tabular"
+        if isinstance(gen, TextNN):
+            return ("text", dataset.resolve_text_branch_name(gen.text_name))
+        if isinstance(gen, ImageNN):
+            return ("image", dataset.resolve_image_branch_name(gen.image_name))
+        return None
+
+    @staticmethod
+    def _precomputed_key_present(key, dataset: MultimodalDataset, avail) -> bool:
+        if key is None:
+            return False
+        if isinstance(key, tuple) and key[0] == "text":
+            return key[1] in dataset.text_names()
+        if isinstance(key, tuple) and key[0] == "image":
+            return key[1] in dataset.image_names()
+        return key in avail
+
+    @staticmethod
+    def _materialize_from_precomputed_single(
+        gen,
+        key,
+        dataset: MultimodalDataset,
+        sample_idx: int,
+        precomputed: Dict[str, Any],
+    ):
+        idx_dist = precomputed.get(key)
+        if idx_dist is None:
+            return None
+        indices_dict, _ = idx_dist
+        if isinstance(gen, TabularNN):
+            return TabularNN._materialize(
+                indices_dict,
+                sample_idx,
+                dataset,
+                distance_metric_label=gen._resolve_distance_metric_label(),
+            )
+        if isinstance(gen, TimeSeriesNN):
+            return TimeSeriesNN._materialize(
+                indices_dict,
+                sample_idx,
+                dataset,
+                gen.ts_name,
+                distance_metric_label=gen._resolve_distance_metric_label(),
+            )
+        if isinstance(gen, TextNN):
+            text_name = dataset.resolve_text_branch_name(gen.text_name)
+            train_text_raw = dataset.get_text_branch(text_name, split="train")
+            if train_text_raw is None:
+                return []
+            return TextNN._materialize(
+                indices_dict,
+                sample_idx,
+                dataset,
+                train_text_raw,
+                text_name,
+                distance_metric_label=gen._resolve_distance_metric_label(),
+                text_encoder_label=gen._resolve_text_encoder_label(),
+            )
+        if isinstance(gen, ImageNN):
+            image_name = dataset.resolve_image_branch_name(gen.image_name)
+            train_img = dataset.get_image_branch(image_name, split="train")
+            if train_img is None:
+                return []
+            return ImageNN._materialize(
+                indices_dict,
+                sample_idx,
+                dataset,
+                train_img,
+                image_name,
+                distance_metric_label=gen._resolve_distance_metric_label(),
+                image_encoder_label=gen._resolve_encoder_label(),
+            )
+        return None
+
+    def _materialize_from_precomputed_batch(
+        self,
+        gen,
+        key,
+        dataset: MultimodalDataset,
+        sample_indices: List[int],
+        precomputed: Dict[str, Any],
+    ):
+        cached_by_key = precomputed.get("_candidate_cache_by_key", {}) or {}
+        if key in cached_by_key:
+            cached = cached_by_key[key]
+            return {int(idx): cached.get(int(idx), []) for idx in sample_indices}
+        return {
+            int(idx): self._materialize_from_precomputed_single(
+                gen, key, dataset, int(idx), precomputed
+            ) or []
+            for idx in sample_indices
+        }
+
+    # ------------------------------------------------------------------
     def _collect_precomputed(
         self,
         dataset: MultimodalDataset,
         sample_idx: int,
         target_value: int,
         k: Optional[int],
+        precomputed_seed: Optional[Dict[str, Any]] = None,
     ):
         """Run generate_raw() on any registered unimodal generators once.
 
@@ -112,33 +213,26 @@ class CounterfactualLibrary:
             ``{id(gen): candidates}`` — already-computed candidate lists for
             each unimodal generator so the main loop can return them directly.
         """
-        pc: Dict[str, Any] = {}
+        pc: Dict[str, Any] = dict(precomputed_seed or {})
         candidates_cache: Dict[int, List] = {}
         avail = dataset.available_modalities
 
         for gen in self.generators.values():
             try:
-                if isinstance(gen, TimeSeriesNN):
-                    key = gen.ts_name
-                elif isinstance(gen, TabularNN):
-                    tab_name = dataset.resolve_tabular_branch_name(gen.tab_name)
-                    key = tab_name if tab_name != dataset.primary_tabular_name else "tabular"
-                elif isinstance(gen, TextNN):
-                    key = ("text", dataset.resolve_text_branch_name(gen.text_name))
-                elif isinstance(gen, ImageNN):
-                    key = ("image", dataset.resolve_image_branch_name(gen.image_name))
-                else:
+                key = self._resolve_precomputed_key(gen, dataset)
+                if key is None:
                     continue
 
-                key_present = True
-                if isinstance(key, tuple) and key[0] == "text":
-                    key_present = (key[1] in dataset.text_names())
-                elif isinstance(key, tuple) and key[0] == "image":
-                    key_present = (key[1] in dataset.image_names())
-                else:
-                    key_present = key in avail
+                key_present = self._precomputed_key_present(key, dataset, avail)
+                if not key_present:
+                    continue
 
-                if key in pc or not key_present:
+                if key in pc:
+                    cached = self._materialize_from_precomputed_single(
+                        gen, key, dataset, int(sample_idx), pc
+                    )
+                    if cached is not None:
+                        candidates_cache[id(gen)] = cached
                     continue
 
                 raw = gen.generate_raw(dataset, sample_idx, target_value=target_value, k=k)
@@ -160,36 +254,28 @@ class CounterfactualLibrary:
         sample_indices: List[int],
         target_value: int,
         k: Optional[int],
+        precomputed_seed: Optional[Dict[str, Any]] = None,
     ):
         """Run generate_raw_batch() on unimodal generators once for many samples."""
-        pc: Dict[str, Any] = {}
+        pc: Dict[str, Any] = dict(precomputed_seed or {})
         candidates_cache: Dict[int, Dict[int, List]] = {}
         avail = dataset.available_modalities
         selected = [int(idx) for idx in sample_indices]
 
         for gen in self.generators.values():
             try:
-                if isinstance(gen, TimeSeriesNN):
-                    key = gen.ts_name
-                elif isinstance(gen, TabularNN):
-                    tab_name = dataset.resolve_tabular_branch_name(gen.tab_name)
-                    key = tab_name if tab_name != dataset.primary_tabular_name else "tabular"
-                elif isinstance(gen, TextNN):
-                    key = ("text", dataset.resolve_text_branch_name(gen.text_name))
-                elif isinstance(gen, ImageNN):
-                    key = ("image", dataset.resolve_image_branch_name(gen.image_name))
-                else:
+                key = self._resolve_precomputed_key(gen, dataset)
+                if key is None:
                     continue
 
-                key_present = True
-                if isinstance(key, tuple) and key[0] == "text":
-                    key_present = (key[1] in dataset.text_names())
-                elif isinstance(key, tuple) and key[0] == "image":
-                    key_present = (key[1] in dataset.image_names())
-                else:
-                    key_present = key in avail
+                key_present = self._precomputed_key_present(key, dataset, avail)
+                if not key_present:
+                    continue
 
-                if key in pc or not key_present:
+                if key in pc:
+                    candidates_cache[id(gen)] = self._materialize_from_precomputed_batch(
+                        gen, key, dataset, selected, pc
+                    )
                     continue
 
                 if hasattr(gen, "generate_raw_batch"):
@@ -243,6 +329,7 @@ class CounterfactualLibrary:
         model: Optional[Any] = None,
         target_value: int = 0,
         k: Optional[int] = None,
+        precomputed_seed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Run all registered generators for a single test sample.
 
@@ -269,9 +356,9 @@ class CounterfactualLibrary:
         has_compound = any(isinstance(g, _compound_types) for g in self.generators.values())
         has_unimodal = any(isinstance(g, _unimodal_types) for g in self.generators.values())
 
-        if has_compound and has_unimodal:
+        if (has_compound and has_unimodal) or precomputed_seed:
             precomputed, candidates_cache = self._collect_precomputed(
-                dataset, sample_idx, target_value, k
+                dataset, sample_idx, target_value, k, precomputed_seed=precomputed_seed
             )
         else:
             precomputed, candidates_cache = {}, {}
@@ -314,6 +401,7 @@ class CounterfactualLibrary:
         model: Optional[Any] = None,
         target_value: int = 0,
         k: Optional[int] = None,
+        precomputed_seed: Optional[Dict[str, Any]] = None,
     ) -> Dict[int, Dict[str, List[Dict[str, Any]]]]:
         """Run all generators for multiple test samples.
 
@@ -327,9 +415,9 @@ class CounterfactualLibrary:
         has_unimodal = any(isinstance(g, _unimodal_types) for g in self.generators.values())
         selected = [int(idx) for idx in sample_indices]
 
-        if has_compound and has_unimodal:
+        if (has_compound and has_unimodal) or precomputed_seed:
             precomputed, candidates_cache = self._collect_precomputed_batch(
-                dataset, selected, target_value, k
+                dataset, selected, target_value, k, precomputed_seed=precomputed_seed
             )
         else:
             precomputed, candidates_cache = {}, {}
