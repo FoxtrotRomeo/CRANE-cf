@@ -56,3 +56,4 @@ htmlcov/
 # Claude
 CLAUDE.md
 METHODS_RECORD.md
+paper_config.json
