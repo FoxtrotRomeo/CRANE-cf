@@ -3267,10 +3267,6 @@ def _ensure_eval_context(
         if train_ts_obs is None:
             raise ValueError("train_ts must be provided to derive default tau_c")
         tau_c = compute_tau_c(train_ts_obs)
-        if isinstance(tau_c, dict):
-            tau_c = {k: np.maximum(np.asarray(v, dtype=float), 1e-3) for k, v in tau_c.items()}
-        else:
-            tau_c = np.maximum(np.asarray(tau_c, dtype=float), 1e-3)
 
     return segments, tau_c
 

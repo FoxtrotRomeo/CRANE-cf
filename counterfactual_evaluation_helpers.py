@@ -1398,10 +1398,15 @@ def multimodal_plausibility(
     outlierness = -float(lof.score_samples(z_arr)[0])
     return outlierness
 
-def compute_tau_c(X_ts_obs, factor=1.1):
+def compute_tau_c(X_ts_obs, factor=0.0):
     """
     X_ts_obs: (N, T, C) normalized time series OR {'labs','meds'} dict of such arrays
     Returns: tau_c of shape (C,) or dict with per-modality tau.
+
+    ``factor=0.0`` (default) yields a zero threshold for every channel, so any
+    nonzero change is counted by the time-series sparsity objective. Projects
+    that want channel-specific noise thresholds can pass a positive factor
+    such as ``1.1`` to recover the previous MAD-based behaviour.
     """
     if _is_split_ts_dict(X_ts_obs):
         X_ts_obs = _ensure_split_ts_batch_dict(X_ts_obs, name="X_ts_obs")
