@@ -190,6 +190,15 @@ Typical candidate structure:
 
 ## Experiments
 
+The library has been applied to explain models from several domains, including
+models from prior published work. The sepsis pipeline in `sepsis/` replicates
+and extends the MASICU classifier introduced in:
+
+> L. Mondrejevski, F. Rugolon, I. Miliou, and P. Papapetrou, "MASICU: A
+> Multimodal Attention-based classifier for Sepsis mortality prediction in the
+> ICU," in *2024 IEEE 37th International Symposium on Computer-Based Medical
+> Systems (CBMS)*, 2024, pp. 326–331. DOI: 10.1109/CBMS61543.2024.00061
+
 The `examples/` directory contains two scripts:
 
 - **`ablation_factory_template.py`** — factory functions that load a
