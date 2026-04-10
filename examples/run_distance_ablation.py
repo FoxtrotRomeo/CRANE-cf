@@ -757,6 +757,10 @@ def _evaluate_combo_objectives(
         np.asarray(dataset.X_test_static)
         if dataset.X_test_static is not None else None
     )
+    X_train_tabular = dict(dataset.X_train_tabular or {})
+    X_test_tabular = dict(dataset.X_test_tabular or {})
+    X_train_ts = dict(dataset.X_train_ts or {})
+    X_test_ts = dict(dataset.X_test_ts or {})
     X_test_text = (
         dataset.get_text_branch(dataset.primary_text_name, split="test")
         if dataset.primary_text_name is not None
@@ -786,8 +790,89 @@ def _evaluate_combo_objectives(
                 text_cand = cand.get("text") or cand.get("text_input")
                 # Strip private/internal keys (those starting with "_") before forwarding
                 # to compute_objectives, which does not accept arbitrary kwargs.
+                helper_kwargs = {
+                    "tabular_objective_context",
+                    "tabular_objective_contexts",
+                    "ts_objective_context",
+                    "ts_objective_contexts",
+                    "text_objective_contexts",
+                    "image_objective_contexts",
+                }
                 clean_kw = {k: v for k, v in objectives_kwargs.items()
-                            if not k.startswith("_")}
+                            if not k.startswith("_") and k not in helper_kwargs}
+                _tabmf = objectives_kwargs.get("_tabular_modalities_fn")
+                if _tabmf is not None:
+                    extra_tab_kw = _tabmf(sample_idx, cand, x_tab_ref)
+                elif isinstance(cand.get("tab"), dict) or x_tab_cand is not None:
+                    tab_ctx_default = objectives_kwargs.get("tabular_objective_context")
+                    tab_ctx_by_name = objectives_kwargs.get("tabular_objective_contexts", {}) or {}
+                    tabular_modalities = {}
+
+                    primary_tab_name = dataset.primary_tabular_name or "__primary__"
+                    if x_tab_cand is not None and x_tab_ref is not None and X_train_static is not None:
+                        primary_spec = {
+                            "x": x_tab_cand,
+                            "x_ref": x_tab_ref,
+                            "X_obs": X_train_static,
+                        }
+                        primary_spec.update(tab_ctx_by_name.get(primary_tab_name, tab_ctx_default) or {})
+                        tabular_modalities[primary_tab_name] = primary_spec
+
+                    for name, cand_tab in (cand.get("tab") or {}).items():
+                        X_obs_tab = X_train_tabular.get(name)
+                        X_ref_tabs = X_test_tabular.get(name)
+                        if cand_tab is None or X_obs_tab is None or X_ref_tabs is None:
+                            continue
+                        if len(X_ref_tabs) <= sample_idx:
+                            continue
+                        spec = {
+                            "x": cand_tab,
+                            "x_ref": X_ref_tabs[sample_idx],
+                            "X_obs": X_obs_tab,
+                        }
+                        spec.update(tab_ctx_by_name.get(name, tab_ctx_default) or {})
+                        tabular_modalities[name] = spec
+
+                    extra_tab_kw = (
+                        {"tabular_modalities": tabular_modalities}
+                        if tabular_modalities
+                        else {
+                            "x_tab": x_tab_cand,
+                            "x_tab_ref": x_tab_ref,
+                            "X_tab_obs": X_train_static,
+                        }
+                    )
+                else:
+                    extra_tab_kw = {
+                        "x_tab": x_tab_cand,
+                        "x_tab_ref": x_tab_ref,
+                        "X_tab_obs": X_train_static,
+                    }
+                _tsmf = objectives_kwargs.get("_ts_modalities_fn")
+                if _tsmf is not None:
+                    extra_ts_kw = _tsmf(sample_idx, cand)
+                elif isinstance(cand.get("ts"), dict):
+                    ts_ctx_default = objectives_kwargs.get("ts_objective_context")
+                    ts_ctx_by_name = objectives_kwargs.get("ts_objective_contexts", {}) or {}
+                    ts_modalities = {}
+                    for name, cand_ts in cand["ts"].items():
+                        ctx = ts_ctx_by_name.get(name, ts_ctx_default)
+                        X_obs_ts = X_train_ts.get(name)
+                        X_ref_ts = X_test_ts.get(name)
+                        if ctx is None or cand_ts is None or X_obs_ts is None or X_ref_ts is None:
+                            continue
+                        if len(X_ref_ts) <= sample_idx:
+                            continue
+                        spec = {
+                            "x": cand_ts,
+                            "x_ref": X_ref_ts[sample_idx],
+                            "X_obs": X_obs_ts,
+                        }
+                        spec.update(ctx or {})
+                        ts_modalities[name] = spec
+                    extra_ts_kw = {"ts_modalities": ts_modalities} if ts_modalities else {}
+                else:
+                    extra_ts_kw = {}
                 # Support per-candidate multi-field text objectives via _text_modalities_fn.
                 # When present, it returns {"text_modalities": {...}} keyed by field name,
                 # replacing the single flat text_candidate/text_factual args.
@@ -840,11 +925,10 @@ def _evaluate_combo_objectives(
                     extra_image_kw = {}
                 try:
                     objs = compute_objectives(
-                        x_tab=x_tab_cand,
-                        x_tab_ref=x_tab_ref,
-                        X_tab_obs=X_train_static,
                         embedding_cache=embedding_cache,
                         text_metrics_cache=text_metrics_cache,
+                        **extra_tab_kw,
+                        **extra_ts_kw,
                         **extra_text_kw,
                         **extra_image_kw,
                         **clean_kw,
@@ -1049,10 +1133,12 @@ def run_distance_ablation(
         - ``predict_fn`` — callable ``(x_tab, x_ts, text) -> float``
         - ``y_target`` — integer target class
         - ``modality_weights`` — ``{modality_name: float}``
+        - ``tabular_objective_context(s)`` — per-tabular-branch plausibility specs
+        - ``ts_objective_context(s)`` — per-time-series specs such as
+          ``segments``, ``tau_c``, and TS plausibility normalizers
 
-        Data args (``x_tab``, ``x_tab_ref``, ``X_tab_obs``,
-        ``text_candidate``, ``text_factual``) are filled automatically
-        from ``dataset`` and each candidate dict.
+        Data args for tabular, time-series, text, and image modalities are
+        filled automatically from ``dataset`` and each candidate dict.
     objectives_kwargs_factory
         Optional callable ``(text_cfg: dict | None, image_cfg: dict | None) -> dict | None``.
         Called once per combo with the combo's text and image config dicts.
