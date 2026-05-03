@@ -100,7 +100,7 @@ parser.add_argument("--source-class",      type=str, default="fake",
                     help="Class to explain (default: fake).")
 parser.add_argument("--target-class",      type=str, default="real",
                     help="Counterfactual target class (default: real).")
-args = parser.parse_args()
+args, _ = parser.parse_known_args()
 
 # ---------------------------------------------------------------------------
 # Load dataset and predictions
@@ -1093,6 +1093,13 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
             "tab_low":  _tab_lof_low,
             "tab_high": _tab_lof_high,
         },
+        "tabular_objective_context": {
+            "plausibility_normalizer": {
+                "lof":  _tab_lof,
+                "low":  _tab_lof_low,
+                "high": _tab_lof_high,
+            }
+        },
     }
     if _predict_fn is not None:
         kwargs["predict_fn"] = _predict_fn
@@ -1200,36 +1207,37 @@ def _multimodal_generators_factory(
     return extras
 
 
-# ---------------------------------------------------------------------------
-# Run ablation
-# ---------------------------------------------------------------------------
-print(f"\nRunning distance ablation …")
-print(f"  Samples : {len(fake_indices)} (predicted '{label_classes[source_value]}')")
-print(f"  Target  : {target_value} ({label_classes[target_value]})")
-print(f"  k       : {args.k}")
-print(f"  n_jobs  : {args.n_jobs}")
-print(f"  Tab metrics   : {tab_metrics}")
-print(f"  Text encoders : {text_encoders}")
-print(f"  Fields        : {_FIELD_NAMES}")
-print()
+if __name__ == "__main__":
+    # ---------------------------------------------------------------------------
+    # Run ablation
+    # ---------------------------------------------------------------------------
+    print(f"\nRunning distance ablation …")
+    print(f"  Samples : {len(fake_indices)} (predicted '{label_classes[source_value]}')")
+    print(f"  Target  : {target_value} ({label_classes[target_value]})")
+    print(f"  k       : {args.k}")
+    print(f"  n_jobs  : {args.n_jobs}")
+    print(f"  Tab metrics   : {tab_metrics}")
+    print(f"  Text encoders : {text_encoders}")
+    print(f"  Fields        : {_FIELD_NAMES}")
+    print()
 
-run_distance_ablation(
-    dataset                   = dataset,
-    model                     = None,
-    sample_indices            = fake_indices,
-    target_value              = target_value,
-    k                         = args.k,
-    tab_metrics               = tab_metrics,
-    ts_metrics                = [],
-    text_encoders             = text_encoders,
-    text_vector_metrics       = text_vector_metrics,
-    text_direct_metrics       = text_direct_metrics,
-    text_backend_kwargs       = text_bk,
-    output_dir                = args.output_dir,
-    run_name                  = args.run_name,
-    save_full                 = args.save_full,
-    max_combinations          = args.max_combinations,
-    n_jobs                    = args.n_jobs,
-    objectives_kwargs_factory = _objectives_kwargs_factory,
-    extra_generators_factory  = _multimodal_generators_factory,
-)
+    run_distance_ablation(
+        dataset                   = dataset,
+        model                     = None,
+        sample_indices            = fake_indices,
+        target_value              = target_value,
+        k                         = args.k,
+        tab_metrics               = tab_metrics,
+        ts_metrics                = [],
+        text_encoders             = text_encoders,
+        text_vector_metrics       = text_vector_metrics,
+        text_direct_metrics       = text_direct_metrics,
+        text_backend_kwargs       = text_bk,
+        output_dir                = args.output_dir,
+        run_name                  = args.run_name,
+        save_full                 = args.save_full,
+        max_combinations          = args.max_combinations,
+        n_jobs                    = args.n_jobs,
+        objectives_kwargs_factory = _objectives_kwargs_factory,
+        extra_generators_factory  = _multimodal_generators_factory,
+    )

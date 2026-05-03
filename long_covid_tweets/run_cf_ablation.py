@@ -576,6 +576,13 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
             "tab_low":  _tab_lof_low,
             "tab_high": _tab_lof_high,
         },
+        "tabular_objective_context": {
+            "plausibility_normalizer": {
+                "lof":  _tab_lof,
+                "low":  _tab_lof_low,
+                "high": _tab_lof_high,
+            }
+        },
     }
     if _predict_fn is not None:
         kwargs["predict_fn"] = _predict_fn
