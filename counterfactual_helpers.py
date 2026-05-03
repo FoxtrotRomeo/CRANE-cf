@@ -635,6 +635,11 @@ def _tokenize_text(text: str) -> list:
 def _lcs_length(tokens_a: list, tokens_b: list) -> int:
     if not tokens_a or not tokens_b:
         return 0
+    try:
+        from rapidfuzz.distance import LCSseq as _LCSseq
+        return int(_LCSseq.similarity(tokens_a, tokens_b))
+    except ImportError:
+        pass
     dp = [0] * (len(tokens_b) + 1)
     for ta in tokens_a:
         prev = 0
