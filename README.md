@@ -1,16 +1,12 @@
-# cf-lib
+# CRANE
 
 <p align="center">
   <img src="assets/CRANE.png" alt="CRANE-cf logo" width="300"/>
 </p>
 
-**Nearest-neighbour multimodal counterfactual generation library.**
+**Counterfactual Retrieval via Agnostic Nearest-neighbour Explanations**
 
-`cf-lib` generates counterfactual explanations for multimodal classifiers by
-searching for the closest opposite-class training samples in configurable
-distance spaces. It supports tabular, time-series, text, and image modalities,
-including multiple named branches of the same modality type, and provides
-several combination strategies.
+`CRANE` generates counterfactual explanations for multimodal classifiers by searching for the closest opposite-class training samples in configurable distance spaces. It supports tabular, time-series, text, and image modalities, including multiple named branches of the same modality type, and provides several combination strategies.
 
 > If you use this library in your research, please cite the associated paper
 > (see [CITATION.cff](CITATION.cff)).
