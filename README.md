@@ -1,5 +1,9 @@
 # cf-lib
 
+<p align="center">
+  <img src="assets/CRANE.png" alt="CRANE-cf logo" width="300"/>
+</p>
+
 **Nearest-neighbour multimodal counterfactual generation library.**
 
 `cf-lib` generates counterfactual explanations for multimodal classifiers by
