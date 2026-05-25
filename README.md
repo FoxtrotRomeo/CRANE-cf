@@ -18,8 +18,8 @@
 Clone the repository and install the core dependencies:
 
 ```bash
-git clone https://github.com/FoxtrotRomeo/cf-lib.git
-cd cf-lib
+git clone https://github.com/FoxtrotRomeo/CRANE-cf.git
+cd CRANE-cf
 pip install .
 ```
 
@@ -70,8 +70,8 @@ lib = CounterfactualLibrary(
         "Tabular":       TabularNN(k=50),
         "Labs TS":       TimeSeriesNN("labs", k=50),
         "Meds TS":       TimeSeriesNN("meds", k=50),
-        "Notes":         TextNN(text_name="notes", k=20, text_encoder="tfidf"),
-        "Image":         ImageNN(image_name="cxr", k=20, image_encoder="resnet50"),
+        "Notes":         TextNN(text_name="notes", k=50, text_encoder="tfidf"),
+        "Image":         ImageNN(image_name="cxr", k=50, image_encoder="resnet50"),
         "Frankenstein":  FrankensteinNN(image_encoder="resnet50"),
         "Combined":      CombinedNN(image_encoder="resnet50"),
     }
@@ -190,28 +190,56 @@ Typical candidate structure:
 
 ## Experiments
 
-The library has been applied to explain models from several domains, including
-models from prior published work. The sepsis pipeline in `sepsis/` replicates
-and extends the MASICU classifier introduced in:
+CRANE has been applied to four multimodal classification datasets, each with
+its own subdirectory containing a dataset factory, an ablation runner, and a
+best-model evaluation script.
+
+| Dataset | Subdirectory | Modalities | Task |
+|---|---|---|---|
+| Long COVID Tweets | `long_covid_tweets/` | Tabular + Text (Italian, XLM-RoBERTa) | Emotion classification (sadness → joy) |
+| Real-or-Fake Jobs | `real_or_fake_jobs/` | Tabular + 3× Text branches (DistilBERT) | Fraud detection (fake → real) |
+| Hateful Memes | `memes/` | Text + Image (CLIP / BERT) | Hate detection |
+| Sepsis mortality | `sepsis/` | Tabular + Time-series (GRU) | In-hospital mortality (death → no death) |
+
+The sepsis pipeline replicates and extends the MASICU classifier introduced in:
 
 > L. Mondrejevski, F. Rugolon, I. Miliou, and P. Papapetrou, "MASICU: A
 > Multimodal Attention-based classifier for Sepsis mortality prediction in the
 > ICU," in *2024 IEEE 37th International Symposium on Computer-Based Medical
 > Systems (CBMS)*, 2024, pp. 326–331. DOI: 10.1109/CBMS61543.2024.00061
 
-The `examples/` directory contains two scripts:
+Each per-dataset subdirectory contains:
+
+- **`*_cf_factory.py`** — builds the `MultimodalDataset` and loads the trained
+  classifier. Accepts a `fusion_strategy` argument (`"intermediate"`,
+  `"early"`, or `"late"`) to select which model checkpoint and pre-computed
+  predictions to use.
+- **`run_cf_ablation.py`** — sweeps distance metric combinations for the
+  dataset. Key flags: `--fusion-strategy {intermediate,early,late}`,
+  `--k` (default 50), `--n-jobs`, `--eval-pkls` (re-evaluate saved pickles at
+  multiple k values without re-running search).
+- **`run_cf_for_best_models.py`** — generates counterfactuals using the
+  best-performing metric combination found in the ablation.
+- **`plot_cf_metrics.py`** — bar charts of the four objectives per generator.
+
+The `examples/` directory contains generic tooling:
 
 - **`ablation_factory_template.py`** — factory functions that load a
   `MultimodalDataset` from `.npy` files on disk, or generate a synthetic
-  dataset for smoke-testing. The file-based factory supports both legacy
-  single-branch files (`X_train_text.npy`, `X_train_img.npy`) and named-branch
-  files such as `X_train_text_<name>.npy` / `X_train_img_<name>.npy` via
-  `text_modalities` and `image_modalities`.
-- **`run_distance_ablation.py`** — CLI runner that sweeps combinations of
-  distance metrics across all modalities and saves results to JSON/pickle.
+  multimodal dataset for smoke-testing. The file-based factory supports both
+  legacy single-branch files (`X_train_text.npy`) and named-branch files such
+  as `X_train_text_<name>.npy` / `X_train_img_<name>.npy`.
+- **`run_distance_ablation.py`** — generic CLI runner that sweeps combinations
+  of distance metrics across all modalities and saves results to JSON/pickle.
   When the dataset contains multiple named text or image branches, the runner
   automatically registers one `TextNN` / `ImageNN` per branch unless the
   factory disables that behavior via backend kwargs.
+- **`run_baselines.py`** — optimisation-based counterfactual baselines (DiCE,
+  NICE, gradient-based TS) for all four datasets. Results are saved in the
+  same schema as ablation runs for direct comparison.
+- **`evaluate_k_ablation.py`** — re-evaluates saved `combo_*_results.pkl`
+  files at multiple k values without re-running NN search, by slicing the
+  pre-sorted candidate lists.
 
 Run from the **repository root**:
 
@@ -223,15 +251,24 @@ python examples/run_distance_ablation.py \
   --max-combinations 5 \
   --max-samples 3
 
-# Real data with image encoder sweep
+# Illustrative example: file-based factory with TS + image modalities.
+# This shows the full set of CLI flags; adapt the factory kwargs to match
+# the modalities actually present in your dataset.
 python examples/run_distance_ablation.py \
   --factory ablation_factory_template:build_dataset_and_model \
-  --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "text_modalities": ["report", "notes"], "image_modalities": ["cxr"], "load_image": true, "image_encoder": "resnet50"}' \
+  --factory-kwargs-json '{"data_root": "/path/to/fold_0", "ts_modalities": ["labs", "meds"], "load_image": true, "image_encoder": "resnet50"}' \
   --image-encoders resnet50 \
   --image-distance-metrics cosine,euclidean \
   --n-jobs 4 \
   --output-dir ablation_runs \
   --max-samples 25
+
+# Per-dataset ablation (example: Long COVID Tweets, intermediate fusion)
+python long_covid_tweets/run_cf_ablation.py --gpu 0 --fusion-strategy intermediate
+
+# Optimisation-based baselines
+python examples/run_baselines.py --dataset sepsis --fold 0 --gpu 0
+python examples/run_baselines.py --dataset long_covid_tweets --gpu 0
 ```
 
 The factory functions return a dict with `"dataset"`, `"model"`,
@@ -252,13 +289,24 @@ candidate: `outcome`, `proximity`, `sparsity`, and `plausibility`.
   is no longer limited to a single tabular / TS / text input.
 - The legacy flat arguments are still supported and are auto-promoted into
   the newer dict-based format for backward compatibility.
-- Text objectives now use generic embedding callables instead of requiring
-  only the older E5-specific path.
-- Image objectives mirror text evaluation with embedding-based proximity,
-  sparsity, and LOF plausibility.
+- Text objectives use generic embedding callables. **Proximity** is
+  `(1 − cos) / 2` in embedding space (range [0, 1]). **Sparsity** is the
+  normalised token-edit distance (Levenshtein / factual length); values above
+  1 are possible when the counterfactual has more tokens than the original.
+- Image **proximity** is cosine distance in embedding space, same formula as
+  text. Image **sparsity** is the pixel-level change fraction: the proportion
+  of pixel elements whose absolute difference between factual and
+  counterfactual exceeds a configurable threshold (default 0, i.e. any
+  nonzero change counts). Values are in [0, 1]. Image **plausibility** uses
+  LOF in embedding space.
 - Plausibility normalizers and LOF references can be fitted on the target
   class only, which makes plausibility scores reflect how typical a
   candidate is within the desired counterfactual class.
+- `fit_proximity_normalizer(...)` computes reference pairwise distance
+  distributions from the training set. Pass the result as
+  `proximity_normalizer` to `compute_objectives` to express proximity
+  relative to the typical within-class spread rather than as an absolute
+  distance.
 
 `examples/run_distance_ablation.py` can also attach objective summaries to
 each ablation row via `objectives_kwargs` or
