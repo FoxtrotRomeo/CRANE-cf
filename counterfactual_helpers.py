@@ -4,19 +4,34 @@ from sklearn.metrics.pairwise import euclidean_distances
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import pandas as pd
-from tensorflow import keras
 from collections import Counter
+
+try:
+    from rapidfuzz.distance import LCSseq as _RapidLCSseq
+    _RAPIDFUZZ_LCS = True
+except ImportError:
+    _RapidLCSseq = None
+    _RAPIDFUZZ_LCS = False
 
 import os
 os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0 --tf_xla_enable_xla_devices=false")
-import tensorflow as tf
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
 
 os.environ["KERAS_BACKEND"] = "torch"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"]="expandable_segments:True"
 
 import torch
-import keras
-from keras import layers
+try:
+    import keras
+    from keras import layers
+    _KERAS_AVAILABLE = True
+except ImportError:
+    keras = None
+    layers = None
+    _KERAS_AVAILABLE = False
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -635,11 +650,8 @@ def _tokenize_text(text: str) -> list:
 def _lcs_length(tokens_a: list, tokens_b: list) -> int:
     if not tokens_a or not tokens_b:
         return 0
-    try:
-        from rapidfuzz.distance import LCSseq as _LCSseq
-        return int(_LCSseq.similarity(tokens_a, tokens_b))
-    except ImportError:
-        pass
+    if _RAPIDFUZZ_LCS:
+        return int(_RapidLCSseq.similarity(tokens_a, tokens_b))
     dp = [0] * (len(tokens_b) + 1)
     for ta in tokens_a:
         prev = 0
@@ -778,15 +790,38 @@ def _pairwise_text_distances(
             pass
 
     out = np.empty((n_query, n_cand), dtype=float)
-    for i, q in enumerate(query_arr):
-        for j, c in enumerate(cand_arr):
-            if distance_fn is not None:
+    if distance_fn is not None:
+        for i, q in enumerate(query_arr):
+            for j, c in enumerate(cand_arr):
                 try:
                     out[i, j] = float(distance_fn(q, c))
                 except Exception:
                     out[i, j] = float(distance_fn(str(q), str(c)))
-            else:
-                out[i, j] = _direct_text_distance(str(q), str(c), distance_metric, metric_kwargs)
+    else:
+        # Precompute tokens once per text to avoid re-tokenising candidate texts
+        # O(n_query) times in the inner loop.
+        metric_norm = _normalize_text_distance_metric(distance_metric, default="rouge_l")
+        q_tokens = [_tokenize_text(str(q)) for q in query_arr]
+        c_tokens = [_tokenize_text(str(c)) for c in cand_arr]
+        for i, qt in enumerate(q_tokens):
+            for j, ct in enumerate(c_tokens):
+                if metric_norm == "lcs":
+                    sim = _lcs_similarity(qt, ct)
+                elif metric_norm == "rouge_l":
+                    sim = _rouge_l_f1_similarity(qt, ct)
+                elif metric_norm == "rouge1":
+                    sim = _rouge_n_f1_similarity(qt, ct, n=1)
+                elif metric_norm == "rouge2":
+                    sim = _rouge_n_f1_similarity(qt, ct, n=2)
+                elif metric_norm == "bleu":
+                    sim = _bleu_similarity(
+                        qt, ct,
+                        max_n=int(metric_kwargs.get("max_n", 4)),
+                        smooth=float(metric_kwargs.get("smooth", 1e-12)),
+                    )
+                else:
+                    sim = _lcs_similarity(qt, ct)
+                out[i, j] = float(1.0 - np.clip(sim, 0.0, 1.0))
     return out
 
 

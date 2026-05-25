@@ -455,13 +455,23 @@ class CounterfactualLibrary:
                 else:
                     gen_batch = getattr(gen, "generate_batch", None)
                     if callable(gen_batch):
-                        batch_results = gen_batch(
-                            dataset=dataset,
-                            sample_indices=selected,
-                            model=model,
-                            target_value=target_value,
-                            k=k,
-                        )
+                        if precomputed and getattr(gen, "_accepts_precomputed_batch", False):
+                            batch_results = gen_batch(
+                                dataset=dataset,
+                                sample_indices=selected,
+                                model=model,
+                                target_value=target_value,
+                                k=k,
+                                precomputed=precomputed,
+                            )
+                        else:
+                            batch_results = gen_batch(
+                                dataset=dataset,
+                                sample_indices=selected,
+                                model=model,
+                                target_value=target_value,
+                                k=k,
+                            )
                     else:
                         batch_results = {
                             int(idx): gen.generate(

@@ -41,14 +41,14 @@ def outcome_objective(pred, y_target):
 # Text-specific objectives (E5 + LOF + token edit sparsity)
 ################################################################
 
-TEXT_MAX_PENALTY_PROX = 2.0
+TEXT_MAX_PENALTY_PROX = 1.0
 TEXT_MAX_PENALTY_PLAUS = 1.0
 
 ################################################################
 # Image-specific objectives (embedding-based)
 ################################################################
 
-IMAGE_MAX_PENALTY_PROX = 2.0
+IMAGE_MAX_PENALTY_PROX = 1.0
 IMAGE_MAX_PENALTY_PLAUS = 1.0
 
 
@@ -271,7 +271,7 @@ def text_proximity_embedding(
         texts = [text_factual or "", text_candidate]
         emb_f, emb_c = _embed_with_cache(texts, embed_fn=embed_fn, embedding_cache=embedding_cache)
         cos = float(np.sum(emb_f * emb_c))
-        return float(np.clip(1.0 - cos, 0.0, float(max_penalty)))
+        return float(np.clip((1.0 - cos) / 2.0, 0.0, float(max_penalty)))
     except Exception:
         return float(max_penalty)
 
@@ -317,6 +317,7 @@ def text_plausibility_lof(
     device=None,
     max_penalty: float = TEXT_MAX_PENALTY_PLAUS,
     embedding_cache: dict = None,
+    train_text_score_lookup: dict = None,
     # Absorb extra keys from fit_text_lof_reference output (e.g. train_embs_txt)
     **_,
 ) -> float:
@@ -331,6 +332,12 @@ def text_plausibility_lof(
     """
     if text_candidate is None or str(text_candidate).strip() == "":
         return float(max_penalty)
+
+    # Fast path: candidate is a training text — score is already known.
+    if train_text_score_lookup is not None:
+        cached = train_text_score_lookup.get(str(text_candidate))
+        if cached is not None:
+            return float(np.clip(percentile_rank(train_raw_scores_txt, cached), 0.0, 1.0))
 
     # Resolve embed_fn from compat kwargs if not given directly
     if embed_fn is None and tokenizer is not None and model is not None and device is not None:
@@ -412,7 +419,13 @@ def fit_text_lof_reference(
     lof = LocalOutlierFactor(n_neighbors=k, metric="euclidean", novelty=True)
     lof.fit(embs)
     train_raw = -np.asarray(lof.score_samples(embs), dtype=float)
-    return {"lof_model_txt": lof, "train_raw_scores_txt": train_raw, "train_embs_txt": embs}
+    train_text_score_lookup = {str(t): float(s) for t, s in zip(texts_to_fit, train_raw)}
+    return {
+        "lof_model_txt": lof,
+        "train_raw_scores_txt": train_raw,
+        "train_embs_txt": embs,
+        "train_text_score_lookup": train_text_score_lookup,
+    }
 
 
 def _token_levenshtein_distance(a: Sequence[str], b: Sequence[str]) -> int:
@@ -441,7 +454,13 @@ def _token_levenshtein_distance(a: Sequence[str], b: Sequence[str]) -> int:
 
 
 def text_sparsity_token_edit(tokens_factual: List[str], tokens_candidate: List[str]) -> float:
-    """Token-edit sparsity = Levenshtein(token)/max(1, len(factual_tokens))."""
+    """Token-edit sparsity ∈ [0, 1].
+
+    Levenshtein(tokens_cf, tokens_factual) / max(1, len(tokens_factual)), capped
+    at 1.0 to handle cases where the counterfactual has more tokens than the
+    factual (which can push the raw ratio above 1).
+    0 = identical token sequence; 1 = completely different (or longer).
+    """
     t1 = list(tokens_factual or [])
     t2 = list(tokens_candidate or [])
     edits = _token_levenshtein_distance(t1, t2)
@@ -488,7 +507,7 @@ def image_proximity_embedding(
         if norm_c > 1e-8:
             emb_c = emb_c / norm_c
         cos = float(np.dot(emb_f, emb_c))
-        return float(np.clip(1.0 - cos, 0.0, float(max_penalty)))
+        return float(np.clip((1.0 - cos) / 2.0, 0.0, float(max_penalty)))
     except Exception:
         return float(max_penalty)
 
@@ -497,28 +516,50 @@ def image_sparsity_embedding(
     image_factual,
     image_candidate,
     *,
-    embed_fn,
-    embedding_cache: dict = None,
+    pixel_threshold: float = 0.0,
+    embed_fn=None,          # kept for API backward compat; not used
+    embedding_cache: dict = None,  # kept for API backward compat; not used
 ) -> float:
-    """L1 distance in embedding space normalised by dimensionality (lower is better).
+    """Pixel-level sparsity ∈ [0, 1] (lower is better).
 
-    Mirrors the spirit of ``text_sparsity_token_edit`` (edit fraction in token
-    space) but operates in continuous embedding space: how much does the
-    embedding change per dimension?  Result lies in ``[0, ∞)`` but is typically
-    small for embeddings from the same distribution.
+    Fraction of pixel elements (across all channels) whose absolute difference
+    between the factual and the counterfactual exceeds ``pixel_threshold``.
+    Images are normalised to [0, 1] before comparison when their dtype is
+    integer (e.g. uint8 with values in [0, 255]).
+
+    0 = every pixel is identical; 1 = every pixel differs by more than the
+    threshold.
+
+    ``pixel_threshold=0`` (default) counts any nonzero change as a difference.
+    ``embed_fn`` and ``embedding_cache`` are accepted but ignored, so existing
+    call sites that pass them continue to work without modification.
     """
     if image_candidate is None:
         return 1.0
-    if embedding_cache is None:
-        embedding_cache = {}
     try:
-        emb_f, emb_c = _embed_images_with_cache(
-            [image_factual, image_candidate], embed_fn=embed_fn, embedding_cache=embedding_cache
-        )
-        emb_f = np.asarray(emb_f, dtype=float)
-        emb_c = np.asarray(emb_c, dtype=float)
-        dim = max(1, emb_f.shape[0])
-        return float(np.sum(np.abs(emb_f - emb_c)) / dim)
+        def _to_float_arr(img):
+            if hasattr(img, "convert"):           # PIL Image
+                arr = np.asarray(img, dtype=float)
+            else:
+                arr = np.asarray(img, dtype=float)
+            if arr.ndim == 0:
+                return arr.reshape(1)
+            # Normalise integer-valued images to [0, 1]
+            if arr.max() > 1.0:
+                arr = arr / 255.0
+            return arr.ravel()
+
+        arr_f = _to_float_arr(image_factual)
+        arr_c = _to_float_arr(image_candidate)
+
+        # If shapes differ (e.g. pre-computed embeddings vs. raw pixels on
+        # different calls), fall back to comparing what we can.
+        n = min(len(arr_f), len(arr_c))
+        if n == 0:
+            return 1.0
+
+        diff = np.abs(arr_f[:n] - arr_c[:n])
+        return float(np.mean(diff > float(pixel_threshold)))
     except Exception:
         return 1.0
 
@@ -531,6 +572,7 @@ def image_plausibility_lof(
     embed_fn,
     max_penalty: float = IMAGE_MAX_PENALTY_PLAUS,
     embedding_cache: dict = None,
+    train_img_score_lookup: dict = None,
     **_,
 ) -> float:
     """LOF plausibility percentile in [0, 1] in image embedding space (lower is better).
@@ -558,6 +600,11 @@ def image_plausibility_lof(
             [image_candidate], embed_fn=embed_fn, embedding_cache=embedding_cache
         )
         emb = np.asarray(emb, dtype=float)
+        # Fast path: candidate is a training image — score is already known.
+        if train_img_score_lookup is not None:
+            cached = train_img_score_lookup.get(emb.astype(np.float32).tobytes())
+            if cached is not None:
+                return float(np.clip(percentile_rank(train_raw_scores_img, cached), 0.0, 1.0))
         raw_score = -float(lof_model_img.score_samples(emb.reshape(1, -1))[0])
         plaus = percentile_rank(train_raw_scores_img, raw_score)
         return float(np.clip(plaus, 0.0, 1.0))
@@ -639,6 +686,9 @@ def fit_image_lof(
     lof.fit(Z)
     raw_scores = -np.asarray(lof.score_samples(Z), dtype=float)
     low, high = np.percentile(raw_scores, [q_low, q_high]).astype(float)
+    train_img_score_lookup = {
+        Z[i].astype(np.float32).tobytes(): float(raw_scores[i]) for i in range(len(Z))
+    }
 
     return {
         "embed_fn": embed_fn,
@@ -646,7 +696,109 @@ def fit_image_lof(
         "train_raw_scores_img": raw_scores,
         "lof_low": float(low),
         "lof_high": float(high),
+        "train_img_score_lookup": train_img_score_lookup,
     }
+
+
+def fit_proximity_normalizer(
+    X_tab_obs=None,
+    X_ts_obs=None,
+    n_pairs: int = 5000,
+    seed: int = 0,
+    y_train=None,
+) -> dict:
+    """Compute reference distance distributions for proximity normalization.
+
+    Samples ``n_pairs`` pairs from the training data, computes their pairwise
+    MAE for each modality, and stores the resulting 1-D arrays.  At evaluation
+    time, ``percentile_rank(ref_dists, d(x, x_cf))`` maps the raw MAE onto
+    [0, 1]: 0 means the CF is as close as the nearest training pair, 1 means
+    it is at least as far as the furthest sampled pair.
+
+    When ``y_train`` is provided, pairs are sampled only across *different*
+    classes (opposite-class pairs).  This avoids a downward bias caused by
+    within-class pairs that are structurally similar, producing a reference
+    distribution that better reflects the real factual→counterfactual gap.
+
+    Parameters
+    ----------
+    X_tab_obs : ndarray (N, D), optional
+    X_ts_obs  : ndarray (N, T, C) or dict {'labs', 'meds'}, optional
+    n_pairs   : number of pairs to sample (default 5000)
+    seed      : random seed
+    y_train   : array-like (N,), optional — class labels; when provided,
+                only cross-class pairs are sampled.
+
+    Returns
+    -------
+    dict with keys ``'tab_ref_dists'`` and/or ``'ts_ref_dists'`` (1-D ndarrays).
+    """
+    rng = np.random.RandomState(seed)
+    result: dict = {}
+
+    def _sample_pairs(N, k, y=None):
+        """Return (ii, jj) index arrays of length k with ii != jj.
+        If y is provided, requires y[ii] != y[jj]."""
+        if y is not None:
+            y = np.asarray(y)
+            classes = np.unique(y)
+            if len(classes) >= 2:
+                pairs_ii, pairs_jj = [], []
+                for c in classes:
+                    idx_c = np.where(y == c)[0]
+                    idx_other = np.where(y != c)[0]
+                    if len(idx_c) == 0 or len(idx_other) == 0:
+                        continue
+                    n_c = min(k // len(classes) + 1, len(idx_c) * len(idx_other))
+                    ci = rng.choice(idx_c, size=n_c, replace=True)
+                    oi = rng.choice(idx_other, size=n_c, replace=True)
+                    pairs_ii.append(ci)
+                    pairs_jj.append(oi)
+                if pairs_ii:
+                    ii = np.concatenate(pairs_ii)[:k]
+                    jj = np.concatenate(pairs_jj)[:k]
+                    return ii, jj
+        # fallback: random pairs ensuring ii != jj
+        ii = rng.randint(0, N, size=k)
+        jj = rng.randint(0, N, size=k)
+        same = ii == jj
+        jj[same] = (jj[same] + 1) % N
+        return ii, jj
+
+    if X_tab_obs is not None:
+        X_tab = np.asarray(X_tab_obs, dtype=float)
+        N = len(X_tab)
+        if N >= 2:
+            k = min(n_pairs, N * (N - 1) // 2)
+            ii, jj = _sample_pairs(N, k, y=y_train)
+            dists = np.mean(np.abs(X_tab[ii] - X_tab[jj]), axis=1)
+            result["tab_ref_dists"] = dists.astype(float)
+
+    if X_ts_obs is not None:
+        if _is_split_ts_dict(X_ts_obs):
+            X_ts_obs = _ensure_split_ts_batch_dict(X_ts_obs, name="X_ts_obs")
+            N = X_ts_obs["labs"].shape[0]
+        else:
+            X_ts_obs = np.asarray(X_ts_obs, dtype=float)
+            N = len(X_ts_obs)
+        if N >= 2:
+            k = min(n_pairs, N * (N - 1) // 2)
+            ii, jj = _sample_pairs(N, k, y=y_train)
+            if isinstance(X_ts_obs, dict):
+                total_abs = np.zeros(k, dtype=float)
+                total_count = 0
+                for key in ("labs", "meds"):
+                    arr = X_ts_obs[key]
+                    delta = np.abs(arr[ii] - arr[jj])
+                    total_abs += delta.reshape(k, -1).sum(axis=1)
+                    total_count += arr.shape[1] * arr.shape[2]
+                dists = total_abs / float(max(1, total_count))
+            else:
+                delta = np.abs(X_ts_obs[ii] - X_ts_obs[jj])
+                dists = delta.reshape(k, -1).mean(axis=1)
+            result["ts_ref_dists"] = dists.astype(float)
+
+    return result
 
 
 def _n_model_inputs(model_like) -> int:
@@ -840,37 +992,59 @@ def _ensure_split_ts_batch_dict(X_ts, *, name: str):
 # Tabular data evaluation metrics
 ###############################################################
 
-def tabular_proximity(x_tab, x_tab_ref):
-    # Gower distance
-    return np.mean(np.abs(x_tab - x_tab_ref))
+def tabular_proximity(x_tab, x_tab_ref, ref_dists=None):
+    """MAE between candidate and factual tabular vectors.
+
+    When ``ref_dists`` is provided (a non-empty 1-D array of pairwise MAE
+    values from the training set), returns ``percentile_rank(ref_dists, mae)``
+    ∈ [0, 1] — 0 means identical to factual, 1 means at least as far as the
+    furthest training-pair distance.  Without ``ref_dists`` (or if it is empty)
+    returns raw MAE (backward compat).
+    """
+    mae = float(np.mean(np.abs(x_tab - x_tab_ref)))
+    if ref_dists is not None and np.asarray(ref_dists).size > 0:
+        return percentile_rank(ref_dists, mae)
+    return mae
 
 def tabular_sparsity(x_tab, x_tab_ref):
-    # L0 norm
-    return np.sum(x_tab != x_tab_ref)
+    """Fraction of tabular features that differ between candidate and factual.
 
-def tabular_plausibility(x_tab, X_tab_obs):
-    # Local Outlier Factor (LOF) of x_tab w.r.t. X_tab_obs
-    # Lower value => more plausible (less outlier-like)
+    Returns L0(x, x_ref) / D ∈ [0, 1], where D is the number of features.
+    0 = no features changed; 1 = every feature changed.
+    """
+    D = max(1, len(x_tab))
+    return float(np.sum(x_tab != x_tab_ref)) / D
 
+def tabular_plausibility(x_tab, X_tab_obs, ref_scores=None):
+    """LOF outlierness of the candidate w.r.t. the training tabular distribution.
+
+    When ``ref_scores`` is provided (a 1-D array of per-training-sample LOF
+    outlierness values), returns ``percentile_rank(ref_scores, outlierness)``
+    ∈ [0, 1] — 0 means as plausible as a typical training point, 1 means a
+    stronger outlier than any training sample.  Without ``ref_scores`` returns
+    raw (negated) LOF score (backward compat, unbounded).
+    """
     n_obs = len(X_tab_obs)
     if n_obs <= 2:
-        # Fallback to 1-NN distance in tabular space when LOF is not well-defined
         dists = np.mean(np.abs(X_tab_obs - x_tab), axis=1)
-        return float(np.min(dists))
+        raw = float(np.min(dists))
+        if ref_scores is not None:
+            return float(np.clip(percentile_rank(ref_scores, raw), 0.0, 1.0))
+        return raw
 
     n_neighbors = max(2, min(20, n_obs - 1))
     lof = LocalOutlierFactor(n_neighbors=n_neighbors, novelty=True)
     lof.fit(X_tab_obs)
-
-    # score_samples: higher = more inlier-like; convert to outlierness (lower = better)
     outlierness = -float(lof.score_samples(x_tab[np.newaxis, :])[0])
+    if ref_scores is not None:
+        return float(np.clip(percentile_rank(ref_scores, outlierness), 0.0, 1.0))
     return outlierness
 
 ################################################################
 # Time series data evaluation metrics
 ################################################################
 
-def _ts_proximity_array(x_ts, x_ts_ref):
+def _ts_proximity_array(x_ts, x_ts_ref, ref_dists=None):
     x_ts = np.asarray(x_ts)
     x_ts_ref = np.asarray(x_ts_ref)
     if x_ts.ndim != 2:
@@ -879,11 +1053,20 @@ def _ts_proximity_array(x_ts, x_ts_ref):
         raise ValueError(
             f"x_ts_ref must have same shape as x_ts; got {x_ts_ref.shape} vs {x_ts.shape}"
         )
-    return float(np.mean(np.abs(x_ts - x_ts_ref)))
+    mae = float(np.mean(np.abs(x_ts - x_ts_ref)))
+    if ref_dists is not None and np.asarray(ref_dists).size > 0:
+        return percentile_rank(ref_dists, mae)
+    return mae
 
 
-def ts_proximity(x_ts, x_ts_ref):
-    # Mean absolute error; supports single array modality or split dict {'labs','meds'}.
+def ts_proximity(x_ts, x_ts_ref, ref_dists=None):
+    """MAE between candidate and factual time series.
+
+    Supports single (T, C) arrays or split dicts {'labs', 'meds'}.
+    When ``ref_dists`` is provided (non-empty) returns
+    ``percentile_rank(ref_dists, mae)`` ∈ [0, 1]; otherwise returns raw MAE
+    (backward compat).
+    """
     if _is_split_ts_dict(x_ts) or _is_split_ts_dict(x_ts_ref):
         x_ts = _ensure_split_ts_sample_dict(x_ts, name="x_ts")
         x_ts_ref = _ensure_split_ts_sample_dict(x_ts_ref, name="x_ts_ref")
@@ -893,8 +1076,11 @@ def ts_proximity(x_ts, x_ts_ref):
             delta = np.abs(x_ts[key] - x_ts_ref[key])
             total_abs += float(np.sum(delta))
             total_count += int(delta.size)
-        return 0.0 if total_count == 0 else float(total_abs / float(total_count))
-    return _ts_proximity_array(x_ts, x_ts_ref)
+        mae = 0.0 if total_count == 0 else float(total_abs / float(total_count))
+        if ref_dists is not None and np.asarray(ref_dists).size > 0:
+            return percentile_rank(ref_dists, mae)
+        return mae
+    return _ts_proximity_array(x_ts, x_ts_ref, ref_dists=ref_dists)
 
 def ts_segment_sparsity(
     x_ts,
@@ -928,17 +1114,17 @@ def ts_segment_sparsity(
         x_ts_ref = _ensure_split_ts_sample_dict(x_ts_ref, name="x_ts_ref")
         if not isinstance(tau_c, dict):
             raise ValueError("tau_c must be a dict {'labs','meds'} when x_ts is split.")
-        total = 0.0
+        vals = []
         for key in ("labs", "meds"):
             seg_k = segments.get(key) if isinstance(segments, dict) else segments
-            total += _ts_segment_sparsity_array(
+            vals.append(_ts_segment_sparsity_array(
                 x_ts[key],
                 x_ts_ref[key],
                 seg_k,
                 tau_c[key],
                 rho=rho,
-            )
-        return float(total)
+            ))
+        return float(np.mean(vals))
     return _ts_segment_sparsity_array(x_ts, x_ts_ref, segments, tau_c, rho=rho)
 
 
@@ -975,7 +1161,8 @@ def _ts_segment_sparsity_array(
     changed_mask = delta > tau_c[None, :]
     changed_counts = changed_mask.sum(axis=0).astype(float)  # (C,)
     fractions = changed_counts / float(timesteps)
-    return float(np.sum(fractions))
+    # Mean over channels → result ∈ [0, 1] (0 = no timestep changed in any channel).
+    return float(np.mean(fractions))
 
 def ts_plausibility(x_ts, X_ts_obs):
     """
@@ -1088,10 +1275,18 @@ def fit_plausibility_normalizer(
     else:
         tab_low, tab_high = np.percentile(tab_scores_obs, [q_low, q_high]).astype(float)
 
+    tab_scores_lookup = (
+        {X_tab_obs[i].astype(np.float32).tobytes(): float(tab_scores_obs[i])
+         for i in range(n_tab_obs)}
+        if tab_scores_obs is not None else {}
+    )
+
     normalizer = {
         "tab_lof": tab_lof,
         "tab_low": float(tab_low),
         "tab_high": float(tab_high),
+        "tab_scores_lookup": tab_scores_lookup,
+        "tab_raw_scores": tab_scores_obs,   # 1-D array for percentile_rank
     }
 
     if _is_split_ts_dict(X_ts_obs):
@@ -1112,13 +1307,24 @@ def fit_plausibility_normalizer(
                 low_k, high_k = 0.0, 1.0
             else:
                 low_k, high_k = np.percentile(scores_k, [q_low, q_high]).astype(float)
+            lookup_k = (
+                {X_flat_k[i].astype(np.float32).tobytes(): float(scores_k[i])
+                 for i in range(n_obs_k)}
+                if scores_k is not None else {}
+            )
             modal_cfg[key] = {
                 "lof": lof_k,
                 "low": float(low_k),
                 "high": float(high_k),
-                "weight": float(max(1, X_obs_k.shape[1] * X_obs_k.shape[2])),
+                "raw_scores": scores_k,        # for percentile_rank normalization
+                "scores_lookup": lookup_k,
             }
         normalizer["ts_modal"] = modal_cfg
+        return normalizer
+
+    if X_ts_obs is None:
+        normalizer.update({"ts_lof": None, "ts_low": 0.0, "ts_high": 1.0,
+                           "ts_scores_lookup": {}, "ts_raw_scores": None})
         return normalizer
 
     X_ts_obs = np.asarray(X_ts_obs)
@@ -1136,9 +1342,18 @@ def fit_plausibility_normalizer(
         ts_low, ts_high = 0.0, 1.0
     else:
         ts_low, ts_high = np.percentile(ts_scores_obs, [q_low, q_high]).astype(float)
+
+    ts_scores_lookup = (
+        {X_ts_flat[i].astype(np.float32).tobytes(): float(ts_scores_obs[i])
+         for i in range(n_ts_obs)}
+        if ts_scores_obs is not None else {}
+    )
+
     normalizer["ts_lof"] = ts_lof
     normalizer["ts_low"] = float(ts_low)
     normalizer["ts_high"] = float(ts_high)
+    normalizer["ts_scores_lookup"] = ts_scores_lookup
+    normalizer["ts_raw_scores"] = ts_scores_obs   # for percentile_rank normalization
     return normalizer
 
 
@@ -1171,22 +1386,27 @@ def normalized_merged_plausibility(
     if tab_lof is None:
         tab_raw = tabular_plausibility(x_tab, X_tab_obs)
     else:
-        tab_raw = -float(tab_lof.score_samples(np.asarray(x_tab)[None, :])[0])
+        _x_tab_arr = np.asarray(x_tab, dtype=np.float32)
+        _tab_lookup = plausibility_normalizer.get("tab_scores_lookup")
+        _tab_hit = _tab_lookup.get(_x_tab_arr.tobytes()) if _tab_lookup else None
+        tab_raw = _tab_hit if _tab_hit is not None else -float(tab_lof.score_samples(_x_tab_arr[None, :])[0])
 
-    tab_norm = _normalize_unit_interval(
-        tab_raw,
-        plausibility_normalizer["tab_low"],
-        plausibility_normalizer["tab_high"],
-    )
+    tab_raw_scores = plausibility_normalizer.get("tab_raw_scores")
+    if tab_raw_scores is not None:
+        tab_norm = float(np.clip(percentile_rank(tab_raw_scores, tab_raw), 0.0, 1.0))
+    else:
+        tab_norm = _normalize_unit_interval(
+            tab_raw,
+            plausibility_normalizer["tab_low"],
+            plausibility_normalizer["tab_high"],
+        )
 
     if _is_split_ts_dict(x_ts) or "ts_modal" in plausibility_normalizer:
         x_ts = _ensure_split_ts_sample_dict(x_ts, name="x_ts")
         modal_cfg = plausibility_normalizer.get("ts_modal", None)
         if modal_cfg is None:
-            # Backward-compat fallback: derive modal normalizers from observed data.
             modal_cfg = fit_plausibility_normalizer(X_tab_obs, X_ts_obs).get("ts_modal", {})
-        ts_num = 0.0
-        ts_den = 0.0
+        ts_vals = []
         X_ts_obs_split = _ensure_split_ts_batch_dict(X_ts_obs, name="X_ts_obs")
         for key in ("labs", "meds"):
             cfg = modal_cfg.get(key, {})
@@ -1194,26 +1414,37 @@ def normalized_merged_plausibility(
             if lof_k is None:
                 raw_k = _ts_plausibility_array(x_ts[key], X_ts_obs_split[key])
             else:
-                raw_k = -float(lof_k.score_samples(np.asarray(x_ts[key]).reshape(1, -1))[0])
-            low_k = float(cfg.get("low", 0.0))
-            high_k = float(cfg.get("high", 1.0))
-            norm_k = _normalize_unit_interval(raw_k, low_k, high_k)
-            w_k = float(cfg.get("weight", max(1, X_ts_obs_split[key].shape[1] * X_ts_obs_split[key].shape[2])))
-            ts_num += w_k * norm_k
-            ts_den += w_k
-        ts_norm = float(ts_num / max(1e-8, ts_den))
+                _x_flat_k = np.asarray(x_ts[key], dtype=np.float32).reshape(-1)
+                _lookup_k = cfg.get("scores_lookup")
+                _hit_k = _lookup_k.get(_x_flat_k.tobytes()) if _lookup_k else None
+                raw_k = _hit_k if _hit_k is not None else -float(lof_k.score_samples(_x_flat_k[None, :])[0])
+            raw_scores_k = cfg.get("raw_scores")
+            if raw_scores_k is not None:
+                norm_k = float(np.clip(percentile_rank(raw_scores_k, raw_k), 0.0, 1.0))
+            else:
+                norm_k = _normalize_unit_interval(
+                    raw_k, float(cfg.get("low", 0.0)), float(cfg.get("high", 1.0))
+                )
+            ts_vals.append(norm_k)
+        ts_norm = float(np.mean(ts_vals)) if ts_vals else 0.0
     else:
         ts_lof = plausibility_normalizer.get("ts_lof", None)
         if ts_lof is None:
             ts_raw = ts_plausibility(x_ts, X_ts_obs)
         else:
-            x_flat = np.asarray(x_ts).reshape(1, -1)
-            ts_raw = -float(ts_lof.score_samples(x_flat)[0])
-        ts_norm = _normalize_unit_interval(
-            ts_raw,
-            plausibility_normalizer["ts_low"],
-            plausibility_normalizer["ts_high"],
-        )
+            _x_flat_ts = np.asarray(x_ts, dtype=np.float32).reshape(-1)
+            _ts_lookup = plausibility_normalizer.get("ts_scores_lookup")
+            _ts_hit = _ts_lookup.get(_x_flat_ts.tobytes()) if _ts_lookup else None
+            ts_raw = _ts_hit if _ts_hit is not None else -float(ts_lof.score_samples(_x_flat_ts[None, :])[0])
+        ts_raw_scores = plausibility_normalizer.get("ts_raw_scores")
+        if ts_raw_scores is not None:
+            ts_norm = float(np.clip(percentile_rank(ts_raw_scores, ts_raw), 0.0, 1.0))
+        else:
+            ts_norm = _normalize_unit_interval(
+                ts_raw,
+                plausibility_normalizer["ts_low"],
+                plausibility_normalizer["ts_high"],
+            )
 
     w_tab = float(np.clip(tab_weight, 0.0, 1.0))
     w_ts = 1.0 - w_tab
@@ -1472,6 +1703,7 @@ def compute_objectives(
     modality_weights: dict = None,
     # --- misc ---
     plausibility_normalizer=None,   # only used with flat (compat) args
+    proximity_normalizer=None,      # dict from fit_proximity_normalizer(); only flat args
     embedding_cache: dict = None,
     text_metrics_cache: dict = None,
 ) -> np.ndarray:
@@ -1546,6 +1778,7 @@ def compute_objectives(
                     "lof": pn_flat["tab_lof"],
                     "low": pn_flat.get("tab_low", 0.0),
                     "high": pn_flat.get("tab_high", 1.0),
+                    "scores_lookup": pn_flat.get("tab_scores_lookup"),
                 }
             tabular_modalities = {"__primary__": {
                 "x": x_tab, "x_ref": x_tab_ref, "X_obs": X_tab_obs,
@@ -1562,6 +1795,7 @@ def compute_objectives(
                     "lof": pn_flat["ts_lof"],
                     "low": pn_flat.get("ts_low", 0.0),
                     "high": pn_flat.get("ts_high", 1.0),
+                    "scores_lookup": pn_flat.get("ts_scores_lookup"),
                 }
             ts_modalities = {"__primary_ts__": {
                 "x": x_ts, "x_ref": x_ts_ref, "X_obs": X_ts_obs,
@@ -1647,46 +1881,64 @@ def compute_objectives(
     plaus_parts: List[tuple] = []
 
     # ---------------------------------------------------------------- tabular
+    _pn = proximity_normalizer or {}
     for name, spec in tabular_modalities.items():
         x = np.asarray(spec["x"])
         x_ref = np.asarray(spec["x_ref"])
         X_obs = np.asarray(spec["X_obs"])
         w = weights[name]
 
-        prox_parts.append((w, float(tabular_proximity(x, x_ref))))
+        tab_ref_dists = spec.get("proximity_ref_dists") or _pn.get("tab_ref_dists")
+        prox_parts.append((w, float(tabular_proximity(x, x_ref, ref_dists=tab_ref_dists))))
         sparse_parts.append((w, float(tabular_sparsity(x, x_ref))))
 
         pn = spec.get("plausibility_normalizer") or {}
         lof = pn.get("lof")
         if lof is not None:
-            raw = -float(lof.score_samples(x[None, :])[0])
-            tab_plaus = _normalize_unit_interval(
-                raw, float(pn.get("low", 0.0)), float(pn.get("high", 1.0))
-            )
+            lookup = pn.get("scores_lookup")
+            raw = (lookup.get(x.astype(np.float32).tobytes()) if lookup else None)
+            if raw is None:
+                raw = -float(lof.score_samples(x[None, :])[0])
+            raw_scores = pn.get("raw_scores")
+            if raw_scores is not None:
+                tab_plaus = float(np.clip(percentile_rank(raw_scores, raw), 0.0, 1.0))
+            else:
+                tab_plaus = _normalize_unit_interval(
+                    raw, float(pn.get("low", 0.0)), float(pn.get("high", 1.0))
+                )
         else:
             tab_plaus = float(tabular_plausibility(x, X_obs))
         plaus_parts.append((w, tab_plaus))
 
     # ---------------------------------------------------------------- time-series
     for name, spec in ts_modalities.items():
-        x = np.asarray(spec["x"])
-        x_ref = np.asarray(spec["x_ref"])
-        X_obs = np.asarray(spec["X_obs"])
+        x = spec["x"]   # may be a split dict; do NOT force np.asarray here
+        x_ref = spec["x_ref"]
+        X_obs = spec["X_obs"]
         segs = spec["segments"]
         tau = spec["tau_c"]
         rho_val = float(spec.get("rho", 0.0))
         w = weights[name]
 
-        prox_parts.append((w, float(ts_proximity(x, x_ref))))
+        ts_ref_dists = spec.get("proximity_ref_dists") or _pn.get("ts_ref_dists")
+        prox_parts.append((w, float(ts_proximity(x, x_ref, ref_dists=ts_ref_dists))))
         sparse_parts.append((w, float(ts_segment_sparsity(x, x_ref, segs, tau, rho_val))))
 
         pn = spec.get("plausibility_normalizer") or {}
         lof = pn.get("lof")
         if lof is not None:
-            raw = -float(lof.score_samples(np.asarray(x).reshape(1, -1))[0])
-            ts_plaus = _normalize_unit_interval(
-                raw, float(pn.get("low", 0.0)), float(pn.get("high", 1.0))
-            )
+            x_flat = np.asarray(x, dtype=np.float32).reshape(-1)
+            lookup = pn.get("scores_lookup")
+            raw = (lookup.get(x_flat.tobytes()) if lookup else None)
+            if raw is None:
+                raw = -float(lof.score_samples(x_flat[None, :])[0])
+            raw_scores = pn.get("raw_scores")
+            if raw_scores is not None:
+                ts_plaus = float(np.clip(percentile_rank(raw_scores, raw), 0.0, 1.0))
+            else:
+                ts_plaus = _normalize_unit_interval(
+                    raw, float(pn.get("low", 0.0)), float(pn.get("high", 1.0))
+                )
         else:
             ts_plaus = float(ts_plausibility(x, X_obs))
         plaus_parts.append((w, ts_plaus))
@@ -1989,6 +2241,7 @@ def _evaluate_counterfactuals_split_ts(
     y_target,
     rho,
     plausibility_normalizer,
+    proximity_normalizer=None,
     tab_plausibility_weight,
     pred_to_label,
     flip_against,
@@ -2153,20 +2406,17 @@ def _evaluate_counterfactuals_split_ts(
             x_ts_ref={"labs": x_labs_ref, "meds": x_meds_ref},
             X_tab_obs=X_tab_obs,
             X_ts_obs=X_ts_obs,
-            model=model,
             segments=segments,
             tau_c=tau_c,
             y_target=y_target,
             rho=rho,
             plausibility_normalizer=plausibility_normalizer,
-            tab_plausibility_weight=tab_plausibility_weight,
+            proximity_normalizer=proximity_normalizer,
             text_factual=text_factual,
             text_candidate=_try_get(text_candidates, i),
             text_tokens_factual=text_tokens_factual,
             text_tokens_candidate=_try_get(text_tokens_candidates, i),
             text_objective_context=text_objective_context,
-            text_input_ref=text_input_ref,
-            text_input_cf=_try_get(text_input_candidates, i),
             embedding_cache=embedding_cache,
         )
 
@@ -2196,6 +2446,7 @@ def evaluate_counterfactuals(
     y_target,
     rho: float = 0.0,
     plausibility_normalizer=None,
+    proximity_normalizer=None,
     tab_plausibility_weight: float = 0.5,
     pred_to_label=None,
     flip_against: str = "factual",
@@ -2251,6 +2502,7 @@ def evaluate_counterfactuals(
             y_target=y_target,
             rho=rho,
             plausibility_normalizer=plausibility_normalizer,
+            proximity_normalizer=proximity_normalizer,
             tab_plausibility_weight=tab_plausibility_weight,
             pred_to_label=pred_to_label,
             flip_against=flip_against,
@@ -2421,20 +2673,17 @@ def evaluate_counterfactuals(
             x_ts_ref=x_ts_ref,
             X_tab_obs=X_tab_obs,
             X_ts_obs=X_ts_obs,
-            model=model,
             segments=segments,
             tau_c=tau_c,
             y_target=y_target,
             rho=rho,
             plausibility_normalizer=plausibility_normalizer,
-            tab_plausibility_weight=tab_plausibility_weight,
+            proximity_normalizer=proximity_normalizer,
             text_factual=text_factual,
             text_candidate=text_cand_i,
             text_tokens_factual=text_tokens_factual,
             text_tokens_candidate=text_tokens_cand_i,
             text_objective_context=text_objective_context,
-            text_input_ref=text_input_ref,
-            text_input_cf=text_input_cf_i,
             embedding_cache=embedding_cache,
         )
 
