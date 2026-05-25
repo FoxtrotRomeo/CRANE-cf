@@ -131,7 +131,7 @@ for strategy in all_strategies:
         print(f"[skip] {strategy}: best model ({best_key}) marked unavailable")
         continue
 
-    run_name = entry["ablation_run_name"]
+    run_name = entry["ablation_run_name"] + "_k50"
     summary_path = OUTPUT_DIR / run_name / "summary.json"
 
     if summary_path.exists():

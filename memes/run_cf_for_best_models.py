@@ -133,7 +133,7 @@ for strategy in all_strategies:
         print(f"[{strategy}] No available model in registry — skipping.")
         continue
     entry    = registry["models"][best_key]
-    run_name = entry["ablation_run_name"]
+    run_name = entry["ablation_run_name"] + "_k50"
     summary_path = Path(args.output_dir) / run_name / "summary.json"
     if summary_path.exists():
         print(f"[{strategy}] Ablation already exists: {summary_path} — skipping.")

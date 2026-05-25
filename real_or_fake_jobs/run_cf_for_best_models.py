@@ -111,7 +111,7 @@ for strategy in all_strategies:
         print(f"[{strategy}] No available model in registry — skipping.")
         continue
     entry = registry["models"][best_key]
-    run_name = entry["ablation_run_name"]
+    run_name = entry["ablation_run_name"] + "_k50"
     summary_path = Path(args.output_dir) / run_name / "summary.json"
     if summary_path.exists():
         print(f"[{strategy}] Ablation already exists: {summary_path} — skipping.")
@@ -280,7 +280,8 @@ text_bk["precomputed_text_embeddings_by_encoder"] = {
     fname: {enc: _precomputed_by_field[fname][enc] for enc, _ in _encoder_embed_fns}
     for fname in _FIELD_NAMES
 }
-text_bk["auto_text_branch_generators"] = False
+text_bk["auto_text_branch_generators"]  = False
+text_bk["precompute_all_text_branches"] = True
 
 # ---------------------------------------------------------------------------
 # Load CLS embedding cache (for early/late deep fusion predict_fn)
@@ -628,6 +629,9 @@ _PREDICT_FN_BUILDERS = {
 # FieldTextNN (copied from run_cf_ablation.py)
 # ===========================================================================
 class _FieldTextNN(CounterfactualGenerator):
+
+    _accepts_precomputed_batch = True
+
     def __init__(self, field_name, inner_texnn, X_train_desc):
         self._field_name = field_name
         self._inner       = inner_texnn
@@ -644,9 +648,23 @@ class _FieldTextNN(CounterfactualGenerator):
                 cand.setdefault("text_inputs", {})["description"] = self._train_desc[src]
         return candidates
 
-    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None):
-        batch = self._inner.generate_batch(dataset, sample_indices, model=model,
-                                           target_value=target_value, k=k)
+    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None,
+                       precomputed=None):
+        text_key = ("text", self._field_name)
+        if precomputed and text_key in precomputed:
+            indices_dict, _ = precomputed[text_key]
+            train_text = dataset.get_text_branch(self._field_name, split="train")
+            batch = {
+                int(idx): TextNN._materialize(
+                    indices_dict, int(idx), dataset, train_text, self._field_name,
+                    distance_metric_label=self._inner._resolve_distance_metric_label(),
+                    text_encoder_label=self._inner._resolve_text_encoder_label(),
+                )
+                for idx in sample_indices
+            }
+        else:
+            batch = self._inner.generate_batch(dataset, sample_indices, model=model,
+                                               target_value=target_value, k=k)
         for candidates in batch.values():
             for cand in candidates:
                 src = cand.get("source_train_idx")

@@ -60,7 +60,7 @@ parser = argparse.ArgumentParser(
     description="Run missing fold-level CF ablations for each fusion strategy."
 )
 parser.add_argument("--gpu",          type=int,  default=None)
-parser.add_argument("--k",            type=int,  default=25)
+parser.add_argument("--k",            type=int,  default=50)
 parser.add_argument("--max-samples",  type=int,  default=None)
 parser.add_argument("--n-jobs",       type=int,  default=1)
 parser.add_argument("--n-folds",      type=int,  default=5)
@@ -70,7 +70,7 @@ parser.add_argument("--output-dir",   type=str,
                     default=str(Path(__file__).resolve().parent / "data" / "ablation_runs"))
 parser.add_argument("--source-class", type=str,  default="death")
 parser.add_argument("--target-class", type=str,  default="no_death")
-parser.add_argument("--save-full",    action="store_true")
+parser.add_argument("--save-full",    action="store_true", default=True)
 parser.add_argument("--dry-run",      action="store_true",
                     help="Print what would be run without executing.")
 parser.add_argument("--strategies",   type=str,  default=None,
@@ -118,7 +118,7 @@ for strategy in all_strategies:
         print(f"[{strategy}] No available model in registry — skipping.")
         continue
     entry    = registry["models"][best_key]
-    run_name = entry["ablation_run_name"]
+    run_name = entry["ablation_run_name"] + "_k50"
 
     missing_folds = []
     for fold in folds:
