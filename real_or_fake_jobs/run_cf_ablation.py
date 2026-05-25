@@ -72,6 +72,7 @@ from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN, TextNN
 from counterfactual_helpers import find_k_closest_latent, find_k_closest_static
+from counterfactual_evaluation_helpers import fit_proximity_normalizer
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -80,7 +81,7 @@ parser = argparse.ArgumentParser(
     description="Fake→Real counterfactual ablation on job postings."
 )
 parser.add_argument("--gpu",               type=int, default=None)
-parser.add_argument("--k",                 type=int, default=20,
+parser.add_argument("--k",                 type=int, default=50,
                     help="Number of nearest neighbours per generator (default: 20).")
 parser.add_argument("--max-samples",       type=int, default=None,
                     help="Cap on how many fake samples to process (default: all).")
@@ -90,22 +91,61 @@ parser.add_argument("--n-jobs",            type=int, default=4,
                     help="Number of ablation combinations to run in parallel.")
 parser.add_argument("--output-dir",        type=str, default="data/ablation_runs")
 parser.add_argument("--run-name",          type=str, default=None)
-parser.add_argument("--save-full",         action="store_true",
+parser.add_argument("--k-search-combined", type=int, default=300,
+                    help="k_search pool size for Frankenstein and Combined generators (default: 300).")
+parser.add_argument("--fusion-strategy",   type=str, default="intermediate",
+                    choices=["intermediate", "early", "late"],
+                    help="Which fusion model to use for predict_fn / latents. "
+                         "intermediate=best_model.pt (default); "
+                         "early=best_model_early_fusion_mlp.pt; "
+                         "late=tfidf_logreg×3 + gbt_tabular averaged.")
+parser.add_argument("--save-full",         action="store_true", default=True,
                     help="Save full candidate dicts as .pkl per combination.")
 parser.add_argument("--no-bert",           action="store_true",
                     help="Skip loading the BERT text backend (faster for smoke tests).")
-parser.add_argument("--word2vec-path",     type=str, default="data/word2vec_google_news_300.kv",
-                    help="Path to a gensim word2vec .bin or .kv file.")
+parser.add_argument("--word2vec-path",     type=str, default=None,
+                    help="Path to a gensim word2vec .bin or .kv file (optional).")
 parser.add_argument("--source-class",      type=str, default="fake",
                     help="Class to explain (default: fake).")
 parser.add_argument("--target-class",      type=str, default="real",
                     help="Counterfactual target class (default: real).")
+parser.add_argument(
+    "--eval-pkls",
+    type=str,
+    default=None,
+    metavar="DIR[,DIR,...]",
+    help=(
+        "Instead of generating new counterfactuals, re-evaluate saved "
+        "combo_*_results.pkl files at multiple k values. "
+        "Comma-separated list of run directories (each containing pkls + "
+        "summary.jsonl). Results are written to <first-dir>/k_ablation_summary.json."
+    ),
+)
+parser.add_argument(
+    "--k-values",
+    type=str,
+    default="1,5,10,20,50",
+    help="Comma-separated k values for --eval-pkls mode (default: 1,5,10,20,50).",
+)
+parser.add_argument(
+    "--reeval-summaries",
+    type=str,
+    default=None,
+    metavar="DIR[,DIR,...]",
+    help=(
+        "Re-score saved combo_*_results.pkl files and overwrite summary.jsonl "
+        "with corrected objective values (e.g. with proximity_normalizer applied). "
+        "Comma-separated list of run directories. A .bak copy of the original "
+        "summary.jsonl is written before overwriting."
+    ),
+)
 args, _ = parser.parse_known_args()
 
 # ---------------------------------------------------------------------------
 # Load dataset and predictions
 # ---------------------------------------------------------------------------
-produced = build_job_dataset(gpu=args.gpu, load_bert=not args.no_bert)
+produced = build_job_dataset(gpu=args.gpu, load_bert=not args.no_bert,
+                             fusion_strategy=args.fusion_strategy)
 
 dataset       = produced["dataset"]
 text_bk       = produced["text_backend_kwargs"]
@@ -201,6 +241,12 @@ _tab_lof_low  = float(np.percentile(_tab_lof_train_scores, 5))
 _tab_lof_high = float(np.percentile(_tab_lof_train_scores, 95))
 print(f"  LOF fitted on {len(dataset.X_train_static):,} samples "
       f"(score range [{_tab_lof_low:.3f}, {_tab_lof_high:.3f}])")
+print("Pre-computing proximity reference distribution …")
+_prox_norm = fit_proximity_normalizer(
+    X_tab_obs=dataset.X_train_static,
+    y_train=dataset.y_train,
+)
+print(f"  Proximity ref dists: {len(_prox_norm.get('tab_ref_dists', []))} tabular pairs sampled.")
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +358,8 @@ text_bk["precomputed_text_embeddings_by_encoder"] = {
     }
     for fname in _FIELD_NAMES
 }
-text_bk["auto_text_branch_generators"] = False
+text_bk["auto_text_branch_generators"]  = False
+text_bk["precompute_all_text_branches"] = True
 
 # ---------------------------------------------------------------------------
 # FieldTextNN — TextNN on a specific field; output "text" is always description
@@ -327,6 +374,8 @@ class FieldTextNN(CounterfactualGenerator):
     sample's *description*, keeping proximity objectives comparable across all
     three field generators.
     """
+
+    _accepts_precomputed_batch = True
 
     def __init__(
         self,
@@ -354,14 +403,24 @@ class FieldTextNN(CounterfactualGenerator):
                 cand.setdefault("text_inputs", {})["description"] = self._train_desc[src]
         return candidates
 
-    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None):
-        batch = self._inner.generate_batch(
-            dataset,
-            sample_indices,
-            model=model,
-            target_value=target_value,
-            k=k,
-        )
+    def generate_batch(self, dataset, sample_indices, model=None, target_value=0, k=None,
+                       precomputed=None):
+        text_key = ("text", self._field_name)
+        if precomputed and text_key in precomputed:
+            indices_dict, _ = precomputed[text_key]
+            train_text = dataset.get_text_branch(self._field_name, split="train")
+            batch = {
+                int(idx): TextNN._materialize(
+                    indices_dict, int(idx), dataset, train_text, self._field_name,
+                    distance_metric_label=self._inner._resolve_distance_metric_label(),
+                    text_encoder_label=self._inner._resolve_text_encoder_label(),
+                )
+                for idx in sample_indices
+            }
+        else:
+            batch = self._inner.generate_batch(
+                dataset, sample_indices, model=model, target_value=target_value, k=k,
+            )
         for candidates in batch.values():
             for cand in candidates:
                 src = cand.get("source_train_idx")
@@ -782,13 +841,14 @@ def _compute_torch_latents(torch_model, tokenizer, device, batch_size=16):
 
 
 # ---------------------------------------------------------------------------
-# Load PyTorch classifier and precompute latents
+# Load classifier and precompute latents / predict_fn (strategy-aware)
 # ---------------------------------------------------------------------------
 _torch_latents: Optional[tuple] = None
 _predict_fn:    Optional[object] = None
 _predict_fn_lock = threading.Lock()  # serializes live GPU inference (cache-miss path)
 _DATA_DIR = Path(__file__).parent / "data"
-_pt_path  = _DATA_DIR / "best_model.pt"
+_fusion_strategy = args.fusion_strategy  # "intermediate" | "early" | "late"
+_pt_path  = _DATA_DIR / "best_model.pt"  # intermediate (default)
 
 # Build a description → (desc, profile, reqs) lookup used as a fallback when
 # source_train_idx is unavailable.  Does NOT depend on the model checkpoint.
@@ -855,7 +915,7 @@ if _pt_path.exists():
             if args.gpu is not None and torch.cuda.is_available()
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        _ckpt = torch.load(_pt_path, map_location=_device_latent)
+        _ckpt = torch.load(_pt_path, map_location="cpu")
         _torch_model = _MultimodalClassifier(
             d_tab           = len(_ckpt["tab_cols"]),
             n_classes       = len(_ckpt["label_classes"]),
@@ -971,6 +1031,195 @@ if _pt_path.exists():
         print(f"[warn] Could not compute model latents — IntermediateFusion will be skipped: {_e}")
 else:
     print(f"[warn] best_model.pt not found at {_pt_path} — IntermediateFusion will be skipped.")
+
+# ---- Early fusion predict_fn -----------------------------------------------
+if _fusion_strategy == "early":
+    _ef_path = _DATA_DIR / "best_model_early_fusion_mlp.pt"
+    if _ef_path.exists() and _bert_embed_fn is not None:
+        try:
+            import torch as _t
+            import torch.nn as _nn
+
+            class _EarlyFusionMLP(_nn.Module):
+                def __init__(self, d_in, n_classes, hidden, dropout):
+                    super().__init__()
+                    self.net = _nn.Sequential(
+                        _nn.Linear(d_in, hidden), _nn.ReLU(), _nn.Dropout(dropout),
+                        _nn.Linear(hidden, hidden // 2), _nn.ReLU(), _nn.Dropout(dropout),
+                        _nn.Linear(hidden // 2, n_classes),
+                    )
+                def forward(self, x): return self.net(x)
+
+            _ef_ckpt   = _t.load(_ef_path, map_location="cpu")
+            _ef_dev    = (
+                f"cuda:{args.gpu}"
+                if args.gpu is not None and _t.cuda.is_available()
+                else ("cuda" if _t.cuda.is_available() else "cpu")
+            )
+            _ef_model  = _EarlyFusionMLP(
+                _ef_ckpt["d_in"], _ef_ckpt["n_classes"],
+                _ef_ckpt.get("hidden", 256), _ef_ckpt.get("dropout", 0.3),
+            ).to(_ef_dev)
+            _ef_model.load_state_dict(_ef_ckpt["state_dict"])
+            _ef_model.eval()
+
+            # Build training-sample prediction cache from precomputed BERT embeddings.
+            _ef_bert_desc  = _precomputed_by_field["description"]["bert"]["train"]
+            _ef_bert_prof  = _precomputed_by_field["company_profile"]["bert"]["train"]
+            _ef_bert_reqs  = _precomputed_by_field["requirements"]["bert"]["train"]
+            _n_tr = len(dataset.X_train_static)
+            _ef_train_pred_cache: dict = {}
+            _BS = 128
+            for _bs in range(0, _n_tr, _BS):
+                _be = min(_bs + _BS, _n_tr)
+                _inp = _t.tensor(np.concatenate([
+                    _ef_bert_desc[_bs:_be],
+                    _ef_bert_prof[_bs:_be],
+                    _ef_bert_reqs[_bs:_be],
+                    dataset.X_train_static[_bs:_be].astype(np.float32),
+                ], axis=1), dtype=_t.float32).to(_ef_dev)
+                with _t.no_grad():
+                    _preds = _ef_model(_inp).argmax(dim=-1).cpu().numpy()
+                for _i, _gi in enumerate(range(_bs, _be)):
+                    _key = (
+                        dataset.X_train_static[_gi].astype(np.float32).tobytes(),
+                        str(X_train_description[_gi]),
+                        str(X_train_company_profile[_gi]),
+                        str(X_train_requirements[_gi]),
+                    )
+                    _ef_train_pred_cache[_key] = float(_preds[_i])
+            print(f"  [early fusion] Cached {len(_ef_train_pred_cache):,} training-sample predictions.")
+
+            def _predict_fn(x_tab_or_dict, x_ts, text_candidate_or_dict,
+                            _model=_ef_model, _dev=_ef_dev,
+                            _cache=_ef_train_pred_cache,
+                            _embed=_bert_embed_fn,
+                            _lock=_predict_fn_lock):
+                import torch as _t2
+                if isinstance(text_candidate_or_dict, dict):
+                    desc    = str(text_candidate_or_dict.get("description",    "") or "")
+                    profile = str(text_candidate_or_dict.get("company_profile", "") or "")
+                    reqs    = str(text_candidate_or_dict.get("requirements",   "") or "")
+                    x_tab   = (x_tab_or_dict.get("__primary__")
+                               if isinstance(x_tab_or_dict, dict) else x_tab_or_dict)
+                else:
+                    text    = str(text_candidate_or_dict) if text_candidate_or_dict is not None else ""
+                    desc, profile, reqs = _desc_to_fields.get(text, (text, "", ""))
+                    x_tab   = x_tab_or_dict
+                if x_tab is not None:
+                    _key = (np.asarray(x_tab, dtype=np.float32).tobytes(), desc, profile, reqs)
+                    _hit = _cache.get(_key)
+                    if _hit is not None:
+                        return _hit
+                # Cache miss: encode live (Frankenstein hybrid)
+                with _lock:
+                    e_d = _embed([desc])[0]
+                    e_p = _embed([profile])[0]
+                    e_r = _embed([reqs])[0]
+                    tab = np.asarray(x_tab, dtype=np.float32)
+                    inp = _t2.tensor(
+                        np.concatenate([e_d, e_p, e_r, tab])[None, :], dtype=_t2.float32
+                    ).to(_dev)
+                    with _t2.no_grad():
+                        return float(_model(inp).argmax(dim=-1).cpu().item())
+
+            print(f"[early fusion] predict_fn ready using {_ef_path.name}")
+        except Exception as _e:
+            print(f"[warn] Early-fusion model failed to load — predict_fn unavailable: {_e}")
+    else:
+        if not _ef_path.exists():
+            print(f"[warn] {_ef_path.name} not found — predict_fn unavailable for early fusion.")
+        else:
+            print("[warn] BERT embed_fn unavailable (--no-bert?) — early-fusion predict_fn skipped.")
+
+# ---- Late fusion predict_fn (nondp: tfidf+logreg × 3 + gbt_tabular) --------
+if _fusion_strategy == "late":
+    import pickle as _pickle
+    _lf_paths = {
+        "description":     _DATA_DIR / "best_model_late_fusion_tfidf_logreg_description.pkl",
+        "company_profile": _DATA_DIR / "best_model_late_fusion_tfidf_logreg_company_profile.pkl",
+        "requirements":    _DATA_DIR / "best_model_late_fusion_tfidf_logreg_requirements.pkl",
+        "tabular":         _DATA_DIR / "best_model_late_fusion_gbt_tabular.pkl",
+    }
+    _lf_models = {}
+    _lf_ok = True
+    for _bname, _bpath in _lf_paths.items():
+        if not _bpath.exists():
+            print(f"[warn] Late-fusion model not found: {_bpath.name} — predict_fn unavailable.")
+            _lf_ok = False
+            break
+        try:
+            with open(_bpath, "rb") as _f:
+                _obj = _pickle.load(_f)
+            if isinstance(_obj, dict) and "tfidf" in _obj:
+                # Text branch: compose TF-IDF + LogReg into a pipeline
+                from sklearn.pipeline import Pipeline as _Pipeline
+                _lf_models[_bname] = _Pipeline([
+                    ("tfidf", _obj["tfidf"]),
+                    ("clf",   _obj["model"]),
+                ])
+            elif isinstance(_obj, dict):
+                _lf_models[_bname] = _obj["model"]
+            else:
+                _lf_models[_bname] = _obj
+        except Exception as _e:
+            print(f"[warn] Failed to load {_bpath.name}: {_e} — predict_fn unavailable.")
+            _lf_ok = False
+            break
+
+    if _lf_ok:
+        def _lf_predict_proba(desc, profile, reqs, x_tab):
+            """Average predict_proba across four late-fusion branch models."""
+            import numpy as _np2
+            p_desc    = _lf_models["description"].predict_proba([desc])[0]
+            p_profile = _lf_models["company_profile"].predict_proba([profile])[0]
+            p_reqs    = _lf_models["requirements"].predict_proba([reqs])[0]
+            p_tab     = _lf_models["tabular"].predict_proba(
+                _np2.asarray(x_tab, dtype=np.float32)[None, :]
+            )[0]
+            return (p_desc + p_profile + p_reqs + p_tab) / 4.0
+
+        # Build training-sample prediction cache
+        _n_tr = len(dataset.X_train_static)
+        _lf_train_pred_cache: dict = {}
+        for _gi in range(_n_tr):
+            _avg = _lf_predict_proba(
+                str(X_train_description[_gi]),
+                str(X_train_company_profile[_gi]),
+                str(X_train_requirements[_gi]),
+                dataset.X_train_static[_gi],
+            )
+            _key = (
+                dataset.X_train_static[_gi].astype(np.float32).tobytes(),
+                str(X_train_description[_gi]),
+                str(X_train_company_profile[_gi]),
+                str(X_train_requirements[_gi]),
+            )
+            _lf_train_pred_cache[_key] = float(np.argmax(_avg))
+        print(f"  [late fusion] Cached {len(_lf_train_pred_cache):,} training-sample predictions.")
+
+        def _predict_fn(x_tab_or_dict, x_ts, text_candidate_or_dict,
+                        _cache=_lf_train_pred_cache):
+            if isinstance(text_candidate_or_dict, dict):
+                desc    = str(text_candidate_or_dict.get("description",    "") or "")
+                profile = str(text_candidate_or_dict.get("company_profile", "") or "")
+                reqs    = str(text_candidate_or_dict.get("requirements",   "") or "")
+                x_tab   = (x_tab_or_dict.get("__primary__")
+                           if isinstance(x_tab_or_dict, dict) else x_tab_or_dict)
+            else:
+                text    = str(text_candidate_or_dict) if text_candidate_or_dict is not None else ""
+                desc, profile, reqs = _desc_to_fields.get(text, (text, "", ""))
+                x_tab   = x_tab_or_dict
+            if x_tab is not None:
+                _key = (np.asarray(x_tab, dtype=np.float32).tobytes(), desc, profile, reqs)
+                _hit = _cache.get(_key)
+                if _hit is not None:
+                    return _hit
+            # Cache miss: run sklearn models live (fast, no GPU)
+            avg = _lf_predict_proba(desc, profile, reqs, x_tab)
+            return float(np.argmax(avg))
+
+        print("[late fusion] predict_fn ready (tfidf_logreg×3 + gbt_tabular averaged).")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1088,6 +1337,7 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
     kwargs: dict = {
         "y_target": target_value,
         "_text_modalities_fn": _text_modalities_fn,
+        "proximity_normalizer": _prox_norm,
         "plausibility_normalizer": {
             "tab_lof":  _tab_lof,
             "tab_low":  _tab_lof_low,
@@ -1109,9 +1359,6 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
 # ---------------------------------------------------------------------------
 # Per-combo generator factory
 # ---------------------------------------------------------------------------
-_k_search = min(50, args.k * 5)
-
-
 def _multimodal_generators_factory(
     tab_cfg,
     ts_cfg,
@@ -1168,7 +1415,7 @@ def _multimodal_generators_factory(
             y_train     = dataset.y_train,
             vec_metric  = vec_metric,
             k           = args.k,
-            k_search    = _k_search,
+            k_search    = args.k_search_combined,
             static_dist_fn = static_dist,
         )
 
@@ -1181,7 +1428,7 @@ def _multimodal_generators_factory(
             y_train     = dataset.y_train,
             vec_metric  = vec_metric,
             k           = args.k,
-            k_search    = _k_search,
+            k_search    = args.k_search_combined,
             static_dist_fn = static_dist,
         )
 
@@ -1211,7 +1458,15 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     # Run ablation
     # ---------------------------------------------------------------------------
+    _default_run_names = {
+        "intermediate": "fusion_intermediate_deep_k50",
+        "early":        "fusion_early_mlp_k50",
+        "late":         "fusion_late_nondp_k50",
+    }
+    _run_name = args.run_name or _default_run_names[_fusion_strategy]
+
     print(f"\nRunning distance ablation …")
+    print(f"  Fusion strategy : {_fusion_strategy}  →  {_run_name}")
     print(f"  Samples : {len(fake_indices)} (predicted '{label_classes[source_value]}')")
     print(f"  Target  : {target_value} ({label_classes[target_value]})")
     print(f"  k       : {args.k}")
@@ -1221,23 +1476,44 @@ if __name__ == "__main__":
     print(f"  Fields        : {_FIELD_NAMES}")
     print()
 
-    run_distance_ablation(
-        dataset                   = dataset,
-        model                     = None,
-        sample_indices            = fake_indices,
-        target_value              = target_value,
-        k                         = args.k,
-        tab_metrics               = tab_metrics,
-        ts_metrics                = [],
-        text_encoders             = text_encoders,
-        text_vector_metrics       = text_vector_metrics,
-        text_direct_metrics       = text_direct_metrics,
-        text_backend_kwargs       = text_bk,
-        output_dir                = args.output_dir,
-        run_name                  = args.run_name,
-        save_full                 = args.save_full,
-        max_combinations          = args.max_combinations,
-        n_jobs                    = args.n_jobs,
-        objectives_kwargs_factory = _objectives_kwargs_factory,
-        extra_generators_factory  = _multimodal_generators_factory,
-    )
+    if args.reeval_summaries:
+        from evaluate_k_ablation import reeval_summaries
+        for _d in [Path(d.strip()) for d in args.reeval_summaries.split(",")]:
+            reeval_summaries(
+                run_dir=_d,
+                dataset=dataset,
+                objectives_kwargs_factory=_objectives_kwargs_factory,
+                k=50,
+            )
+    elif args.eval_pkls:
+        from evaluate_k_ablation import evaluate_k_ablation
+        _eval_dirs = [Path(d.strip()) for d in args.eval_pkls.split(",")]
+        _k_vals = [int(x) for x in args.k_values.split(",")]
+        evaluate_k_ablation(
+            run_dirs=_eval_dirs,
+            dataset=dataset,
+            objectives_kwargs_factory=_objectives_kwargs_factory,
+            k_values=_k_vals,
+            output_path=_eval_dirs[0] / f"k_ablation_summary_k{'_'.join(str(k) for k in _k_vals)}.json",
+        )
+    else:
+        run_distance_ablation(
+            dataset                   = dataset,
+            model                     = None,
+            sample_indices            = fake_indices,
+            target_value              = target_value,
+            k                         = args.k,
+            tab_metrics               = tab_metrics,
+            ts_metrics                = [],
+            text_encoders             = text_encoders,
+            text_vector_metrics       = text_vector_metrics,
+            text_direct_metrics       = text_direct_metrics,
+            text_backend_kwargs       = text_bk,
+            output_dir                = args.output_dir,
+            run_name                  = _run_name,
+            save_full                 = args.save_full,
+            max_combinations          = args.max_combinations,
+            n_jobs                    = args.n_jobs,
+            objectives_kwargs_factory = _objectives_kwargs_factory,
+            extra_generators_factory  = _multimodal_generators_factory,
+        )

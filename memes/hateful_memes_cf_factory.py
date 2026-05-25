@@ -41,6 +41,7 @@ def build_hateful_memes_dataset(
     data_dir: Optional[str] = None,
     gpu: Optional[int] = None,
     load_bert: bool = True,
+    fusion_strategy: str = "intermediate",
 ) -> Dict[str, Any]:
     """Load the Hateful Memes MultimodalDataset and (optionally) the BERT backend.
 
@@ -82,7 +83,12 @@ def build_hateful_memes_dataset(
     )
 
     # ---- predictions ----
-    y_pred_path = root / "y_pred.npy"
+    _pred_filename = {
+        "intermediate": "y_pred.npy",
+        "early":        "y_pred_early_fusion_gbt.npy",
+        "late":         "y_pred_late_fusion_nondp.npy",
+    }.get(fusion_strategy, "y_pred.npy")
+    y_pred_path = root / _pred_filename
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else None
 
     # ---- text backend ----

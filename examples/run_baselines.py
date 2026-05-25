@@ -202,6 +202,148 @@ class _JobsClassifier(nn.Module):
         return self.classifier(torch.cat([d_emb, p_emb, r_emb, tab_emb], dim=1))
 
 
+# ===========================================================================
+# Additional model classes for early / late fusion strategies
+# ===========================================================================
+
+class _EarlyFusionMLP(nn.Module):
+    """MLP for early-fusion (tweets, jobs, memes).
+
+    Supports variable depth so it can load checkpoints trained with either 2 or
+    3 hidden layers.  Use ``from_checkpoint`` to build the right architecture
+    directly from a saved state_dict.
+    """
+    def __init__(self, d_in: int, n_classes: int, hidden: int = 256,
+                 dropout: float = 0.3, depth: int = 2):
+        super().__init__()
+        sizes = [hidden // (2 ** i) for i in range(depth)]
+        layers: list = []
+        prev = d_in
+        for sz in sizes:
+            layers += [nn.Linear(prev, sz), nn.ReLU(), nn.Dropout(dropout)]
+            prev = sz
+        layers.append(nn.Linear(prev, n_classes))
+        self.net = nn.Sequential(*layers)
+
+    @staticmethod
+    def depth_from_state_dict(state_dict: dict) -> int:
+        max_idx = max(int(k.split(".")[1]) for k in state_dict if k.startswith("net."))
+        # Each hidden block occupies 3 indices (Linear/ReLU/Dropout).
+        # Output Linear is at index 3*depth, so depth = max_idx // 3.
+        return max_idx // 3
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class _SepsisIFModel(nn.Module):
+    """Sepsis intermediate-fusion MLP encoder (mirrors train_intermediate_fusion.py).
+
+    Architecture matches the saved checkpoint from train_intermediate_fusion.py:
+    - static_enc: Linear → ReLU → Dropout  (NOT Tanh, despite spec pseudocode)
+    - fusion: Linear → Tanh → BatchNorm1d → Dropout  (matches SepsisIFModel.fusion)
+    """
+    def __init__(self, n_ts: int = 53, n_static: int = 47,
+                 ts_hidden: int = 32, static_hidden: int = 32,
+                 fused_hidden: int = 32, dropout: float = 0.2):
+        super().__init__()
+        self.gru        = nn.GRU(n_ts, ts_hidden, batch_first=True)
+        self.ts_drop    = nn.Dropout(dropout)
+        self.static_enc = nn.Sequential(
+            nn.Linear(n_static, static_hidden), nn.ReLU(), nn.Dropout(dropout)
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(ts_hidden + static_hidden, fused_hidden),
+            nn.Tanh(),
+            nn.BatchNorm1d(fused_hidden, momentum=0.01, eps=0.001),
+            nn.Dropout(dropout),
+        )
+        self.output_layer = nn.Linear(fused_hidden, 1)
+
+    def encode(self, x_ts: torch.Tensor, x_static: torch.Tensor) -> torch.Tensor:
+        _, h = self.gru(x_ts)
+        h = self.ts_drop(h.squeeze(0))
+        s = self.static_enc(x_static)
+        return self.fusion(torch.cat([h, s], dim=1))
+
+    def forward(self, x_ts: torch.Tensor, x_static: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.output_layer(self.encode(x_ts, x_static)))
+
+
+class _SepsisTSModel(nn.Module):
+    """GRU-only branch for Sepsis late fusion (mirrors train_late_fusion.py TSOnlyModel)."""
+    def __init__(self, n_ts: int = 53, gru_hidden: int = 32,
+                 dense_hidden: int = 32, dropout: float = 0.2):
+        super().__init__()
+        self.gru   = nn.GRU(n_ts, gru_hidden, batch_first=True)
+        self.drop  = nn.Dropout(dropout)
+        self.dense = nn.Linear(gru_hidden, dense_hidden)
+        self.bn    = nn.BatchNorm1d(dense_hidden, momentum=0.01, eps=0.001)
+        self.out   = nn.Linear(dense_hidden, 1)
+
+    def forward(self, x_ts: torch.Tensor) -> torch.Tensor:
+        _, h = self.gru(x_ts)
+        h = self.drop(h.squeeze(0))
+        h = torch.tanh(self.dense(h))
+        h = self.bn(h)
+        return torch.sigmoid(self.out(h))
+
+
+class _SepsisStaticModel(nn.Module):
+    """MLP-only branch for Sepsis late fusion (mirrors train_late_fusion.py StaticOnlyModel)."""
+    def __init__(self, n_static: int = 47, hidden: int = 32, dropout: float = 0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_static, hidden), nn.Tanh(),
+            nn.BatchNorm1d(hidden, momentum=0.01, eps=0.001),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x_static: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.net(x_static))
+
+
+class _SepsisLateWrapper(nn.Module):
+    """Averages TSOnly + StaticOnly branch outputs (same interface as SepsisModel)."""
+    def __init__(self, ts_model: nn.Module, static_model: nn.Module):
+        super().__init__()
+        self.ts = ts_model
+        self.st = static_model
+
+    def forward(self, x_ts: torch.Tensor, x_static: torch.Tensor) -> torch.Tensor:
+        return (self.ts(x_ts) + self.st(x_static)) / 2.0
+
+    def eval(self):  # type: ignore[override]
+        self.ts.eval()
+        self.st.eval()
+        return super().eval()
+
+    def train(self, mode: bool = True):  # type: ignore[override]
+        self.ts.train(mode)
+        self.st.train(mode)
+        return super().train(mode)
+
+
+class _SepsisIFRFWrapper(nn.Module):
+    """Intermediate-fusion RF wrapper — encoder encodes to latent, RF classifies."""
+    def __init__(self, if_encoder: _SepsisIFModel, rf):
+        super().__init__()
+        self.enc = if_encoder
+        self.rf  = rf
+
+    def forward(self, x_ts: torch.Tensor, x_static: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            latent = self.enc.encode(x_ts, x_static).cpu().numpy()
+        p = self.rf.predict_proba(latent)[:, 1].astype(np.float32)
+        return torch.tensor(p, device=x_ts.device).unsqueeze(1)
+
+    def eval(self):  # type: ignore[override]
+        self.enc.eval()
+        return super().eval()
+
+
+# ===========================================================================
 # Sepsis model — imported from the sepsis package
 def _load_sepsis_model(model_path: Path, device: str):
     sys.path.insert(0, str(_ROOT / "sepsis"))
@@ -253,6 +395,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ts-n-segments", type=int, default=10,
                    help="(Sepsis TS) Number of equal-width time windows for "
                         "NativeGuide-ISW and CoMTE segment swap.")
+    p.add_argument("--fusion-strategy", default="intermediate",
+                   choices=["early", "intermediate", "late"],
+                   help="Which fusion-strategy model to load for baselines. "
+                        "Default: intermediate (existing behaviour unchanged).")
     return p.parse_args()
 
 
@@ -276,22 +422,19 @@ def _default_output_dir(dataset: str, root: Path) -> Path:
 
 def _select_source_samples(
     y_pred: np.ndarray,
-    y_test: np.ndarray,
     source_class: int,
     max_samples: Optional[int],
 ) -> List[int]:
-    """Return test indices predicted (or labelled) as *source_class*.
+    """Return test indices predicted as *source_class*.
 
-    Falls back to true labels when the model predicts no source-class samples,
-    e.g. when the classifier is conservative and produces all-one-class output.
+    Only uses y_pred. Raises if no predicted source-class samples exist.
     """
     indices = [i for i, p in enumerate(y_pred) if int(p) == source_class]
     if not indices:
-        print(
-            f"  [warn] y_pred has no samples of class {source_class}; "
-            "falling back to y_test (true labels) for sample selection."
+        raise ValueError(
+            f"y_pred has no samples predicted as class {source_class}. "
+            "Cannot generate counterfactuals without predicted source-class samples."
         )
-        indices = [i for i, t in enumerate(y_test) if int(t) == source_class]
     if max_samples:
         indices = indices[:max_samples]
     return indices
@@ -365,8 +508,18 @@ def _build_emb_col_names(dim: int) -> List[str]:
 def run_long_covid_baselines(args: argparse.Namespace) -> None:
     dataset_dir = _ROOT / "long_covid_tweets"
     data_dir = Path(args.output_dir).parent if args.output_dir else dataset_dir / "data"
-    out_root = Path(args.output_dir) if args.output_dir else dataset_dir / "data" / "baselines"
+    fusion_strategy = getattr(args, "fusion_strategy", "intermediate")
     device = _resolve_device(args.gpu)
+
+    # Determine output root per fusion strategy
+    if args.output_dir:
+        out_root = Path(args.output_dir)
+    elif fusion_strategy == "intermediate":
+        out_root = dataset_dir / "data" / "baselines"
+    elif fusion_strategy == "early":
+        out_root = dataset_dir / "data" / "baselines_fusion_early"
+    else:  # late
+        out_root = dataset_dir / "data" / "baselines_fusion_late"
 
     # ---- Load data ----
     npz = np.load(data_dir / "dataset.npz", allow_pickle=True)
@@ -379,21 +532,54 @@ def run_long_covid_baselines(args: argparse.Namespace) -> None:
     tab_col_names  = npz["tab_cols"].tolist()
     label_classes  = npz["label_classes"].tolist()
 
-    # ---- Load model ----
-    ckpt = torch.load(data_dir / "best_model.pt", map_location="cpu")
-    cfg  = ckpt["config"]
-    model = _TweetClassifier(
-        d_tab           = len(ckpt["tab_cols"]),
-        n_classes       = len(ckpt["label_classes"]),
-        tab_hidden_dims = cfg["tab_hidden_dims"],
-        text_hidden_dim = cfg["text_hidden_dim"],
-        dropout         = cfg["dropout"],
-    ).to(device)
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
+    # ---- Load strategy-specific model ----
+    # is_deep: whether gradient-based baselines are applicable
+    # has_text: whether text-based baselines are applicable
+    is_deep   = True
+    has_text  = True
+    tokenizer = None
+    model     = None
 
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(_TweetClassifier.TEXT_MODEL)
+    if fusion_strategy == "intermediate":
+        # Existing behaviour — load the intermediate (best) model
+        ckpt = torch.load(data_dir / "best_model.pt", map_location="cpu")
+        cfg  = ckpt["config"]
+        model = _TweetClassifier(
+            d_tab           = len(ckpt["tab_cols"]),
+            n_classes       = len(ckpt["label_classes"]),
+            tab_hidden_dims = cfg["tab_hidden_dims"],
+            text_hidden_dim = cfg["text_hidden_dim"],
+            dropout         = cfg["dropout"],
+        ).to(device)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(_TweetClassifier.TEXT_MODEL)
+
+    elif fusion_strategy == "early":
+        # Early fusion MLP: uses pre-computed CLS embeddings
+        ef_ckpt = torch.load(data_dir / "best_model_early_fusion_mlp.pt", map_location="cpu")
+        ef_state = ef_ckpt["state_dict"]
+        ef_d_in     = ef_ckpt["d_in"]
+        ef_n_cls    = ef_ckpt["n_classes"]
+        ef_hidden   = ef_ckpt.get("hidden", 256)
+        ef_dropout  = ef_ckpt.get("dropout", 0.3)
+        ef_label_classes = ef_ckpt["label_classes"]
+        label_classes = ef_label_classes  # override
+        ef_depth = _EarlyFusionMLP.depth_from_state_dict(ef_state)
+        model = _EarlyFusionMLP(ef_d_in, ef_n_cls, ef_hidden, ef_dropout, depth=ef_depth).to(device)
+        model.load_state_dict(ef_state)
+        model.eval()
+        is_deep  = True
+        has_text = True  # text embeddings are precomputed; no live tokenizer needed
+        tokenizer = None  # not used for early fusion
+
+    elif fusion_strategy == "late":
+        # Late fusion: tfidf+logreg for text; GBT for tabular (may fail to load)
+        # Text-based baselines not applicable (sklearn models, no gradient)
+        is_deep  = False
+        has_text = False
+        print("[long_covid] late fusion: text baselines skipped (non-deep sklearn model)")
 
     # ---- Determine sample indices ----
     target_value = args.target_value
@@ -402,7 +588,12 @@ def run_long_covid_baselines(args: argparse.Namespace) -> None:
         source_class = label_classes.index("sadness") if "sadness" in label_classes else 0
         target_value = label_classes.index("joy") if "joy" in label_classes else 1
 
-    y_pred_path = data_dir / "y_pred.npy"
+    _tweet_pred_file = {
+        "intermediate": "y_pred.npy",
+        "early":        "y_pred_early_fusion_mlp.npy",
+        "late":         "y_pred_late_fusion_tfidf_logreg_nondp.npy",
+    }.get(fusion_strategy, "y_pred.npy")
+    y_pred_path = data_dir / _tweet_pred_file
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else y_test
     sample_indices: List[int]
     if args.sample_indices:
@@ -413,11 +604,12 @@ def run_long_covid_baselines(args: argparse.Namespace) -> None:
                  label_classes[0])
         ))
         sample_indices = _select_source_samples(
-            y_pred, y_test, source_class, args.max_samples
+            y_pred, source_class, args.max_samples
         )
 
     k = args.k
-    print(f"[long_covid] {len(sample_indices)} samples → target={label_classes[target_value]}")
+    print(f"[long_covid] {len(sample_indices)} samples → target={label_classes[target_value]}"
+          f"  fusion_strategy={fusion_strategy}")
 
     # ---- Pre-compute feature types ----
     continuous_tab, categorical_tab = infer_feature_types(X_train_static, tab_col_names)
@@ -427,77 +619,398 @@ def run_long_covid_baselines(args: argparse.Namespace) -> None:
     print("[long_covid] Fitting tabular LOF …")
     tab_lof = fit_tabular_lof(X_train_static)
 
-    # ---- Pre-compute text embeddings (train + test) ----
-    print("[long_covid] Encoding training text …")
-    X_train_emb = _encode_texts_batch(
-        X_train_text, tokenizer, model.text_encoder, device
-    )  # (n_train, 768)
-    print("[long_covid] Encoding test text …")
-    X_test_emb = _encode_texts_batch(
-        X_test_text, tokenizer, model.text_encoder, device
-    )  # (n_test, 768)
-    emb_dim = X_train_emb.shape[1]
-    emb_col_names = _build_emb_col_names(emb_dim)
+    if fusion_strategy == "intermediate":
+        # ---- Existing intermediate-fusion path ----
+        # Pre-compute text embeddings (train + test)
+        print("[long_covid] Encoding training text …")
+        X_train_emb = _encode_texts_batch(
+            X_train_text, tokenizer, model.text_encoder, device
+        )  # (n_train, 768)
+        print("[long_covid] Encoding test text …")
+        X_test_emb = _encode_texts_batch(
+            X_test_text, tokenizer, model.text_encoder, device
+        )  # (n_test, 768)
+        emb_dim = X_train_emb.shape[1]
+        emb_col_names = _build_emb_col_names(emb_dim)
 
-    # ===================================================================
-    # Baseline 1: DiCE_tabular
-    # ===================================================================
-    _run_long_covid_dice_tabular(
-        args, out_root, device, model, tokenizer,
-        X_train_static, y_train, X_test_static, X_test_text,
-        tab_col_names, continuous_tab, categorical_tab, tab_lof,
-        sample_indices, target_value, label_classes, k,
-    )
+        _run_long_covid_dice_tabular(
+            args, out_root, device, model, tokenizer,
+            X_train_static, y_train, X_test_static, X_test_text,
+            tab_col_names, continuous_tab, categorical_tab, tab_lof,
+            sample_indices, target_value, label_classes, k,
+        )
+        _run_long_covid_nice_tabular(
+            args, out_root, device, model, tokenizer,
+            X_train_static, y_train, X_test_static, X_test_text,
+            tab_lof,
+            sample_indices, target_value, k,
+        )
+        _run_long_covid_dice_text(
+            args, out_root, device, model,
+            X_train_static, X_train_emb, y_train,
+            X_test_static, X_test_emb,
+            emb_col_names,
+            sample_indices, target_value, label_classes, k,
+        )
+        _run_long_covid_nice_text(
+            args, out_root, device, model,
+            X_train_static, X_train_emb, y_train,
+            X_test_static, X_test_emb,
+            sample_indices, target_value, k,
+        )
+        _run_long_covid_gradient_tab(
+            args, out_root, device, model, tokenizer,
+            X_train_static, y_train, X_test_static, X_test_text,
+            tab_lof, sample_indices, target_value, label_classes, k,
+        )
+        _run_long_covid_gradient_text(
+            args, out_root, device, model,
+            X_train_static, X_train_emb, y_train,
+            X_test_static, X_test_emb,
+            sample_indices, target_value, label_classes, k,
+        )
 
-    # ===================================================================
-    # Baseline 2: NICE_tabular
-    # ===================================================================
-    _run_long_covid_nice_tabular(
-        args, out_root, device, model, tokenizer,
-        X_train_static, y_train, X_test_static, X_test_text,
-        tab_lof,
-        sample_indices, target_value, k,
-    )
+    elif fusion_strategy == "early":
+        # ---- Early fusion path ----
+        # Load precomputed text CLS embeddings
+        print("[long_covid] Loading precomputed early-fusion text embeddings …")
+        emb_data   = torch.load(data_dir / "early_fusion_text_embeddings.pt",
+                                map_location="cpu")
+        X_train_emb = emb_data["train"].numpy().astype(np.float32)  # (n_train, 768)
+        X_test_emb  = emb_data["test"].numpy().astype(np.float32)   # (n_test,  768)
+        emb_dim     = X_train_emb.shape[1]
+        emb_col_names = _build_emb_col_names(emb_dim)
 
-    # ===================================================================
-    # Baseline 3: DiCE_text_tweet
-    # ===================================================================
-    _run_long_covid_dice_text(
-        args, out_root, device, model,
-        X_train_static, X_train_emb, y_train,
-        X_test_static, X_test_emb,
-        emb_col_names,
-        sample_indices, target_value, label_classes, k,
-    )
+        # Build tabular predict_proba factory for early fusion:
+        # Concatenate precomputed text emb (fixed) + tabular (varied)
+        # model input: concat(text_emb, x_tab) → (d_in,)
+        n_classes = model.net[-1].out_features
 
-    # ===================================================================
-    # Baseline 4: NICE_text_tweet
-    # ===================================================================
-    _run_long_covid_nice_text(
-        args, out_root, device, model,
-        X_train_static, X_train_emb, y_train,
-        X_test_static, X_test_emb,
-        sample_indices, target_value, k,
-    )
+        def _make_ef_predict_proba_tab(sample_idx, x_tab_factual):
+            text_emb_fixed = torch.tensor(
+                X_test_emb[sample_idx][np.newaxis, :], dtype=torch.float32
+            ).to(device)
+            def predict_proba_tab(arr: np.ndarray) -> np.ndarray:
+                x_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                B = x_t.size(0)
+                inp = torch.cat([text_emb_fixed.expand(B, -1), x_t], dim=1)
+                with torch.no_grad():
+                    logits = model(inp)
+                    probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                return probs
+            return predict_proba_tab
 
-    # ===================================================================
-    # Baseline 5: GRADIENT_tabular
-    # ===================================================================
-    _run_long_covid_gradient_tab(
-        args, out_root, device, model, tokenizer,
-        X_train_static, y_train, X_test_static, X_test_text,
-        tab_lof, sample_indices, target_value, label_classes, k,
-    )
+        def _make_ef_predict_proba_text(sample_idx, x_tab_factual):
+            tab_fixed = torch.tensor(
+                x_tab_factual[np.newaxis, :], dtype=torch.float32
+            ).to(device)
+            def predict_proba_emb(arr: np.ndarray) -> np.ndarray:
+                emb_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                B = emb_t.size(0)
+                inp = torch.cat([emb_t, tab_fixed.expand(B, -1)], dim=1)
+                with torch.no_grad():
+                    logits = model(inp)
+                    probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                return probs
+            return predict_proba_emb
 
-    # ===================================================================
-    # Baseline 6: GRADIENT_text_tweet
-    # ===================================================================
-    _run_long_covid_gradient_text(
-        args, out_root, device, model,
-        X_train_static, X_train_emb, y_train,
-        X_test_static, X_test_emb,
-        sample_indices, target_value, label_classes, k,
+        _run_long_covid_ef_dice_tabular(
+            args, out_root,
+            X_train_static, y_train, X_test_static,
+            tab_col_names, continuous_tab, categorical_tab, tab_lof,
+            sample_indices, target_value, label_classes, k,
+            _make_ef_predict_proba_tab,
+        )
+        _run_long_covid_ef_nice_tabular(
+            args, out_root,
+            X_train_static, y_train, X_test_static,
+            tab_lof, sample_indices, target_value, k,
+            _make_ef_predict_proba_tab,
+        )
+        _run_long_covid_ef_dice_text(
+            args, out_root,
+            X_train_emb, y_train, X_test_static, X_test_emb,
+            emb_col_names, sample_indices, target_value, label_classes, k,
+            _make_ef_predict_proba_text,
+        )
+        _run_long_covid_ef_nice_text(
+            args, out_root,
+            X_train_emb, y_train, X_test_static, X_test_emb,
+            sample_indices, target_value, k,
+            _make_ef_predict_proba_text,
+        )
+        print("[skip] GRADIENT_tabular — gradient not supported for early-fusion MLP "
+              "(use intermediate strategy for gradient baselines)")
+        print("[skip] GRADIENT_text_tweet — gradient not supported for early-fusion MLP")
+
+    else:  # late
+        # ---- Late fusion path ----
+        # Load tfidf+logreg for text; GBT for tabular (may fail)
+        import pickle
+
+        # Text model: tfidf + LogisticRegression
+        text_model_path = data_dir / "best_model_late_fusion_tfidf_logreg_text.pkl"
+        text_model_dict = None
+        if text_model_path.exists():
+            with open(text_model_path, "rb") as f:
+                text_model_dict = pickle.load(f)
+            print("[long_covid] Loaded late-fusion text model (tfidf+logreg)")
+
+        # GBT tabular model (may fail due to numpy RNG compatibility)
+        gbt_model_path = data_dir / "best_model_late_fusion_gbt_tabular.pkl"
+        gbt_model = None
+        if gbt_model_path.exists():
+            try:
+                with open(gbt_model_path, "rb") as f:
+                    gbt_model = pickle.load(f)
+                if isinstance(gbt_model, dict):
+                    gbt_model = gbt_model["model"]
+                print("[long_covid] Loaded late-fusion GBT tabular model")
+            except Exception as e:
+                print(f"[long_covid] Warning: failed to load GBT model ({e}); "
+                      "tabular baselines will be skipped")
+
+        # Run tabular baselines only if GBT loaded successfully
+        if gbt_model is not None:
+            n_classes_late = (len(label_classes)
+                              if hasattr(gbt_model, "classes_") else 2)
+
+            def _make_late_predict_proba_tab(sample_idx, x_tab_factual):
+                def predict_proba_tab(arr: np.ndarray) -> np.ndarray:
+                    return gbt_model.predict_proba(arr).astype(np.float32)
+                return predict_proba_tab
+
+            _run_long_covid_ef_dice_tabular(
+                args, out_root,
+                X_train_static, y_train, X_test_static,
+                tab_col_names, continuous_tab, categorical_tab, tab_lof,
+                sample_indices, target_value, label_classes, k,
+                _make_late_predict_proba_tab,
+            )
+            _run_long_covid_ef_nice_tabular(
+                args, out_root,
+                X_train_static, y_train, X_test_static,
+                tab_lof, sample_indices, target_value, k,
+                _make_late_predict_proba_tab,
+            )
+        else:
+            print("[skip] DiCE_tabular / NICE_tabular — GBT model could not be loaded")
+
+        print("[skip] Text baselines — late fusion text model is non-deep "
+              "(no gradient, skipping DiCE/NICE embedding perturbation for this strategy)")
+        print("[skip] GRADIENT_tabular — gradient not supported for non-deep strategy")
+        print("[skip] GRADIENT_text_tweet — gradient not supported for non-deep strategy")
+
+
+def _run_long_covid_ef_dice_tabular(
+    args, out_root,
+    X_train_static, y_train, X_test_static,
+    tab_col_names, continuous_tab, categorical_tab, tab_lof,
+    sample_indices, target_value, label_classes, k,
+    make_predict_proba_tab,
+):
+    """DiCE_tabular for early/late fusion using a factory-produced predict_proba."""
+    name = "DiCE_tabular"
+    print(f"\n[long_covid] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts: Dict[str, int] = {name: 0}
+    n_classes = len(label_classes)
+    threshold = max(0.15, 1.0 / n_classes)
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        predict_proba_tab = make_predict_proba_tab(sample_idx, x_tab_factual)
+        cfs, converged = run_dice_on_features(
+            X_train=X_train_static, y_train=y_train,
+            col_names=tab_col_names,
+            continuous_cols=continuous_tab, categorical_cols=categorical_tab,
+            x_query=x_tab_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_tab,
+            k=k, sample_size=args.dice_sample_size, random_seed=args.dice_seed,
+            stopping_threshold=threshold,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for x_cf in cfs:
+            obj_accum.append(compute_tabular_objectives(
+                x_cf, x_tab_factual, tab_lof, predict_proba_tab, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="long_covid_tweets",
+        method="dice_random", modality="tabular",
+        held_fixed=["text_tweet"], embedding_space=False,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
     )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}  ({n_converged}/{len(sample_indices)} converged)")
+
+
+def _run_long_covid_ef_nice_tabular(
+    args, out_root,
+    X_train_static, y_train, X_test_static,
+    tab_lof, sample_indices, target_value, k,
+    make_predict_proba_tab,
+):
+    """NICE_tabular for early/late fusion using a factory-produced predict_proba."""
+    name = "NICE_tabular"
+    print(f"\n[long_covid] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts: Dict[str, int] = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        predict_proba_tab = make_predict_proba_tab(sample_idx, x_tab_factual)
+        cfs, converged = run_nice(
+            X_train=X_train_static, y_train=y_train,
+            x_query=x_tab_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_tab, k=k,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for x_cf in cfs:
+            obj_accum.append(compute_tabular_objectives(
+                x_cf, x_tab_factual, tab_lof, predict_proba_tab, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="long_covid_tweets",
+        method="nice", modality="tabular",
+        held_fixed=["text_tweet"], embedding_space=False,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}  ({n_converged}/{len(sample_indices)} converged)")
+
+
+def _run_long_covid_ef_dice_text(
+    args, out_root,
+    X_train_emb, y_train, X_test_static, X_test_emb,
+    emb_col_names, sample_indices, target_value, label_classes, k,
+    make_predict_proba_text,
+):
+    """DiCE_text_tweet for early fusion using precomputed embeddings."""
+    name = "DiCE_text_tweet"
+    print(f"\n[long_covid] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts: Dict[str, int] = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        emb_factual   = X_test_emb[sample_idx]
+        predict_proba_emb = make_predict_proba_text(sample_idx, x_tab_factual)
+        cfs, converged = run_dice_embedding_fast(
+            X_train=X_train_emb, y_train=y_train,
+            x_query=emb_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_emb,
+            k=k, sample_size=args.dice_sample_size, random_seed=args.dice_seed,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for emb_cf in cfs:
+            obj_accum.append(compute_embedding_objectives(
+                emb_cf, emb_factual, predict_proba_emb, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="long_covid_tweets",
+        method="dice_random", modality="text_tweet",
+        held_fixed=["tabular"], embedding_space=True,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+        notes=(
+            "Result is a perturbed CLS-token embedding, NOT actual text. "
+            "Proximity and sparsity are measured in embedding space (cosine / mean-L1). "
+            "Plausibility is NaN (no LOF fitted for embedding space)."
+        ),
+    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}  ({n_converged}/{len(sample_indices)} converged)")
+
+
+def _run_long_covid_ef_nice_text(
+    args, out_root,
+    X_train_emb, y_train, X_test_static, X_test_emb,
+    sample_indices, target_value, k,
+    make_predict_proba_text,
+):
+    """NICE_text_tweet for early fusion using precomputed embeddings."""
+    name = "NICE_text_tweet"
+    print(f"\n[long_covid] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts: Dict[str, int] = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        emb_factual   = X_test_emb[sample_idx]
+        predict_proba_emb = make_predict_proba_text(sample_idx, x_tab_factual)
+        cfs, converged = run_nice(
+            X_train=X_train_emb, y_train=y_train,
+            x_query=emb_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_emb, k=k,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for emb_cf in cfs:
+            obj_accum.append(compute_embedding_objectives(
+                emb_cf, emb_factual, predict_proba_emb, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="long_covid_tweets",
+        method="nice", modality="text_tweet",
+        held_fixed=["tabular"], embedding_space=True,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+        notes=(
+            "Result is a perturbed CLS-token embedding, NOT actual text. "
+            "Proximity and sparsity in embedding space. Plausibility is NaN."
+        ),
+    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}  ({n_converged}/{len(sample_indices)} converged)")
 
 
 def _run_long_covid_dice_tabular(
@@ -817,8 +1330,18 @@ def _run_long_covid_nice_text(
 def run_jobs_baselines(args: argparse.Namespace) -> None:
     dataset_dir = _ROOT / "real_or_fake_jobs"
     data_dir = dataset_dir / "data"
-    out_root = Path(args.output_dir) if args.output_dir else dataset_dir / "data" / "baselines"
+    fusion_strategy = getattr(args, "fusion_strategy", "intermediate")
     device = _resolve_device(args.gpu)
+
+    # Determine output root per fusion strategy
+    if args.output_dir:
+        out_root = Path(args.output_dir)
+    elif fusion_strategy == "intermediate":
+        out_root = dataset_dir / "data" / "baselines"
+    elif fusion_strategy == "early":
+        out_root = dataset_dir / "data" / "baselines_fusion_early"
+    else:  # late
+        out_root = dataset_dir / "data" / "baselines_fusion_late"
 
     # ---- Load data ----
     npz = np.load(data_dir / "dataset.npz", allow_pickle=True)
@@ -838,39 +1361,29 @@ def run_jobs_baselines(args: argparse.Namespace) -> None:
                             npz["X_test_requirements"].tolist()),
     }
 
-    # ---- Load model ----
-    ckpt = torch.load(data_dir / "best_model.pt", map_location="cpu")
-    cfg  = ckpt["config"]
-    model = _JobsClassifier(
-        d_tab           = len(ckpt["tab_cols"]),
-        n_classes       = len(ckpt["label_classes"]),
-        tab_hidden_dims = cfg["tab_hidden_dims"],
-        text_hidden_dim = cfg["text_hidden_dim"],
-        dropout         = cfg["dropout"],
-    ).to(device)
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(_JobsClassifier.TEXT_MODEL)
-
     # ---- Determine sample indices (fake jobs → real) ----
     target_value = args.target_value
     if target_value is None:
         target_value = label_classes.index("real") if "real" in label_classes else 0
 
-    y_pred_path = data_dir / "y_pred.npy"
+    _jobs_pred_file = {
+        "intermediate": "y_pred.npy",
+        "early":        "y_pred_early_fusion_mlp.npy",
+        "late":         "y_pred_late_fusion_tfidf_logreg_nondp.npy",
+    }.get(fusion_strategy, "y_pred.npy")
+    y_pred_path = data_dir / _jobs_pred_file
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else y_test
     if args.sample_indices:
         sample_indices = _parse_csv_indices(args.sample_indices)
     else:
         source_class = 1 - target_value
         sample_indices = _select_source_samples(
-            y_pred, y_test, source_class, args.max_samples
+            y_pred, source_class, args.max_samples
         )
 
     k = args.k
-    print(f"[jobs] {len(sample_indices)} samples → target={label_classes[target_value]}")
+    print(f"[jobs] {len(sample_indices)} samples → target={label_classes[target_value]}"
+          f"  fusion_strategy={fusion_strategy}")
 
     # ---- Feature types + LOF ----
     continuous_tab, categorical_tab = infer_feature_types(X_train_static, tab_col_names)
@@ -878,110 +1391,479 @@ def run_jobs_baselines(args: argparse.Namespace) -> None:
     print("[jobs] Fitting tabular LOF …")
     tab_lof = fit_tabular_lof(X_train_static)
 
-    # ---- Pre-compute text embeddings for each branch ----
-    branch_train_embs: Dict[str, np.ndarray] = {}
-    branch_test_embs:  Dict[str, np.ndarray] = {}
-    for branch, (tr_texts, te_texts) in text_branches.items():
-        print(f"[jobs] Encoding {branch} (train) …")
-        branch_train_embs[branch] = _encode_texts_batch(
-            tr_texts, tokenizer, model.text_encoder, device, max_len=512
-        )
-        print(f"[jobs] Encoding {branch} (test) …")
-        branch_test_embs[branch] = _encode_texts_batch(
-            te_texts, tokenizer, model.text_encoder, device, max_len=512
-        )
+    if fusion_strategy == "intermediate":
+        # ---- Existing intermediate-fusion path ----
+        ckpt = torch.load(data_dir / "best_model.pt", map_location="cpu")
+        cfg  = ckpt["config"]
+        model = _JobsClassifier(
+            d_tab           = len(ckpt["tab_cols"]),
+            n_classes       = len(ckpt["label_classes"]),
+            tab_hidden_dims = cfg["tab_hidden_dims"],
+            text_hidden_dim = cfg["text_hidden_dim"],
+            dropout         = cfg["dropout"],
+        ).to(device)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(_JobsClassifier.TEXT_MODEL)
 
-    emb_dim       = branch_train_embs["description"].shape[1]
-    emb_col_names = _build_emb_col_names(emb_dim)
+        # Pre-compute text embeddings for each branch
+        branch_train_embs: Dict[str, np.ndarray] = {}
+        branch_test_embs:  Dict[str, np.ndarray] = {}
+        for branch, (tr_texts, te_texts) in text_branches.items():
+            print(f"[jobs] Encoding {branch} (train) …")
+            branch_train_embs[branch] = _encode_texts_batch(
+                tr_texts, tokenizer, model.text_encoder, device, max_len=512
+            )
+            print(f"[jobs] Encoding {branch} (test) …")
+            branch_test_embs[branch] = _encode_texts_batch(
+                te_texts, tokenizer, model.text_encoder, device, max_len=512
+            )
 
-    # Pre-compute fixed tab embeddings for all test samples (batch once)
-    X_test_t = torch.tensor(X_test_static, dtype=torch.float32).to(device)
-    with torch.no_grad():
-        tab_embs_test_all = model.tab_head(X_test_t).cpu().numpy()  # (n_test, tab_out)
+        emb_dim       = branch_train_embs["description"].shape[1]
+        emb_col_names = _build_emb_col_names(emb_dim)
 
-    # Projection modules keyed by branch name
-    proj_modules = {
-        "description":     model.proj_description,
-        "company_profile": model.proj_company_profile,
-        "requirements":    model.proj_requirements,
-    }
-    # Pre-compute fixed embeddings for all other branches (test set)
-    def _precompute_fixed_embs(branch_train_embs, branch_test_embs, device):
-        """Return {branch: (n_test, text_hidden_dim) numpy array}."""
-        result: Dict[str, np.ndarray] = {}
-        for bname, proj in proj_modules.items():
-            emb_t = torch.tensor(branch_test_embs[bname],
-                                 dtype=torch.float32).to(device)
-            with torch.no_grad():
-                result[bname] = proj(emb_t).cpu().numpy()
-        return result
+        # Pre-compute fixed tab embeddings for all test samples (batch once)
+        X_test_t = torch.tensor(X_test_static, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            tab_embs_test_all = model.tab_head(X_test_t).cpu().numpy()
 
-    fixed_proj_embs = _precompute_fixed_embs(branch_train_embs, branch_test_embs, device)
+        proj_modules = {
+            "description":     model.proj_description,
+            "company_profile": model.proj_company_profile,
+            "requirements":    model.proj_requirements,
+        }
 
-    # ===================================================================
-    # Baseline: DiCE_tabular
-    # ===================================================================
-    _run_jobs_dice_tabular(
-        args, out_root, device, model, tokenizer,
-        X_train_static, y_train, X_test_static, text_branches,
-        tab_col_names, continuous_tab, categorical_tab, tab_lof,
-        fixed_proj_embs,
-        sample_indices, target_value, label_classes, k,
-    )
+        def _precompute_fixed_embs_intermediate(bte, dev):
+            result: Dict[str, np.ndarray] = {}
+            for bname, proj in proj_modules.items():
+                emb_t = torch.tensor(bte[bname], dtype=torch.float32).to(dev)
+                with torch.no_grad():
+                    result[bname] = proj(emb_t).cpu().numpy()
+            return result
 
-    # ===================================================================
-    # Baseline: NICE_tabular
-    # ===================================================================
-    _run_jobs_nice_tabular(
-        args, out_root, device, model, tokenizer,
-        X_train_static, y_train, X_test_static, text_branches,
-        tab_lof, fixed_proj_embs,
-        sample_indices, target_value, k,
-    )
+        fixed_proj_embs = _precompute_fixed_embs_intermediate(branch_test_embs, device)
 
-    # ===================================================================
-    # Baselines: DiCE_text_<branch>, NICE_text_<branch>,
-    #            GRADIENT_text_<branch> for each branch
-    # ===================================================================
-    for branch in text_branches:
-        _run_jobs_dice_text(
-            args, out_root, device, model, branch,
-            branch_train_embs[branch], y_train,
-            branch_test_embs[branch],
-            emb_col_names,
-            tab_embs_test_all,
+        _run_jobs_dice_tabular(
+            args, out_root, device, model, tokenizer,
+            X_train_static, y_train, X_test_static, text_branches,
+            tab_col_names, continuous_tab, categorical_tab, tab_lof,
             fixed_proj_embs,
-            proj_modules[branch],
             sample_indices, target_value, label_classes, k,
         )
-        _run_jobs_nice_text(
-            args, out_root, device, model, branch,
-            branch_train_embs[branch], y_train,
-            branch_test_embs[branch],
-            tab_embs_test_all,
-            fixed_proj_embs,
-            proj_modules[branch],
+        _run_jobs_nice_tabular(
+            args, out_root, device, model, tokenizer,
+            X_train_static, y_train, X_test_static, text_branches,
+            tab_lof, fixed_proj_embs,
             sample_indices, target_value, k,
         )
-        _run_jobs_gradient_text(
-            args, out_root, device, model, branch,
-            branch_train_embs[branch], y_train,
-            branch_test_embs[branch],
-            tab_embs_test_all,
-            fixed_proj_embs,
-            proj_modules[branch],
+        for branch in text_branches:
+            _run_jobs_dice_text(
+                args, out_root, device, model, branch,
+                branch_train_embs[branch], y_train,
+                branch_test_embs[branch],
+                emb_col_names,
+                tab_embs_test_all,
+                fixed_proj_embs,
+                proj_modules[branch],
+                sample_indices, target_value, label_classes, k,
+            )
+            _run_jobs_nice_text(
+                args, out_root, device, model, branch,
+                branch_train_embs[branch], y_train,
+                branch_test_embs[branch],
+                tab_embs_test_all,
+                fixed_proj_embs,
+                proj_modules[branch],
+                sample_indices, target_value, k,
+            )
+            _run_jobs_gradient_text(
+                args, out_root, device, model, branch,
+                branch_train_embs[branch], y_train,
+                branch_test_embs[branch],
+                tab_embs_test_all,
+                fixed_proj_embs,
+                proj_modules[branch],
+                sample_indices, target_value, label_classes, k,
+            )
+        _run_jobs_gradient_tab(
+            args, out_root, device, model,
+            X_train_static, y_train, X_test_static,
+            tab_lof, fixed_proj_embs,
             sample_indices, target_value, label_classes, k,
         )
 
-    # ===================================================================
-    # Baseline: GRADIENT_tabular
-    # ===================================================================
-    _run_jobs_gradient_tab(
-        args, out_root, device, model,
-        X_train_static, y_train, X_test_static,
-        tab_lof, fixed_proj_embs,
-        sample_indices, target_value, label_classes, k,
+    elif fusion_strategy == "early":
+        # ---- Early fusion path ----
+        # Load early fusion MLP (d_in = 3*768 + D_TAB)
+        ef_ckpt = torch.load(data_dir / "best_model_early_fusion_mlp.pt", map_location="cpu")
+        ef_d_in    = ef_ckpt["d_in"]
+        ef_n_cls   = ef_ckpt["n_classes"]
+        ef_hidden  = ef_ckpt.get("hidden", 256)
+        ef_dropout = ef_ckpt.get("dropout", 0.3)
+        label_classes = ef_ckpt["label_classes"]
+        ef_depth = _EarlyFusionMLP.depth_from_state_dict(ef_ckpt["state_dict"])
+        ef_model = _EarlyFusionMLP(ef_d_in, ef_n_cls, ef_hidden, ef_dropout, depth=ef_depth).to(device)
+        ef_model.load_state_dict(ef_ckpt["state_dict"])
+        ef_model.eval()
+
+        # Load precomputed text CLS embeddings per branch
+        print("[jobs] Loading precomputed early-fusion text embeddings …")
+        emb_data = torch.load(data_dir / "early_fusion_text_embeddings.pt",
+                              map_location="cpu")
+        # emb_data: {train: {desc/company_profile/requirements: (n,768)},
+        #            test:  {desc/company_profile/requirements: (n,768)}}
+        branch_train_embs = {b: emb_data["train"][b].numpy().astype(np.float32)
+                             for b in ("description", "company_profile", "requirements")}
+        branch_test_embs  = {b: emb_data["test"][b].numpy().astype(np.float32)
+                             for b in ("description", "company_profile", "requirements")}
+        emb_dim       = branch_train_embs["description"].shape[1]
+        emb_col_names = _build_emb_col_names(emb_dim)
+
+        D_TAB = X_train_static.shape[1]
+
+        def _make_ef_jobs_predict_proba_tab(sample_idx, x_tab_factual):
+            # Fix all three text embs; vary tabular
+            desc_fixed   = torch.tensor(branch_test_embs["description"][sample_idx][np.newaxis, :],
+                                        dtype=torch.float32).to(device)
+            prof_fixed   = torch.tensor(branch_test_embs["company_profile"][sample_idx][np.newaxis, :],
+                                        dtype=torch.float32).to(device)
+            reqs_fixed   = torch.tensor(branch_test_embs["requirements"][sample_idx][np.newaxis, :],
+                                        dtype=torch.float32).to(device)
+            def predict_proba_tab(arr: np.ndarray) -> np.ndarray:
+                x_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                B = x_t.size(0)
+                inp = torch.cat([
+                    desc_fixed.expand(B, -1),
+                    prof_fixed.expand(B, -1),
+                    reqs_fixed.expand(B, -1),
+                    x_t,
+                ], dim=1)
+                with torch.no_grad():
+                    logits = ef_model(inp)
+                    probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                return probs
+            return predict_proba_tab
+
+        def _make_ef_jobs_predict_proba_text(branch_name, sample_idx, x_tab_factual):
+            other_branches = [b for b in ("description", "company_profile", "requirements")
+                              if b != branch_name]
+            other_fixed = {b: torch.tensor(branch_test_embs[b][sample_idx][np.newaxis, :],
+                                           dtype=torch.float32).to(device)
+                           for b in other_branches}
+            tab_fixed = torch.tensor(x_tab_factual[np.newaxis, :],
+                                     dtype=torch.float32).to(device)
+            def predict_proba_emb(arr: np.ndarray) -> np.ndarray:
+                emb_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                B = emb_t.size(0)
+                parts = []
+                for b in ("description", "company_profile", "requirements"):
+                    if b == branch_name:
+                        parts.append(emb_t)
+                    else:
+                        parts.append(other_fixed[b].expand(B, -1))
+                parts.append(tab_fixed.expand(B, -1))
+                inp = torch.cat(parts, dim=1)
+                with torch.no_grad():
+                    logits = ef_model(inp)
+                    probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                return probs
+            return predict_proba_emb
+
+        _run_jobs_ef_dice_tabular(
+            args, out_root,
+            X_train_static, y_train, X_test_static,
+            tab_col_names, continuous_tab, categorical_tab, tab_lof,
+            sample_indices, target_value, label_classes, k,
+            _make_ef_jobs_predict_proba_tab,
+        )
+        _run_jobs_ef_nice_tabular(
+            args, out_root,
+            X_train_static, y_train, X_test_static,
+            tab_lof, sample_indices, target_value, k,
+            _make_ef_jobs_predict_proba_tab,
+        )
+        for branch in ("description", "company_profile", "requirements"):
+            make_pptext = lambda si, xtf, b=branch: _make_ef_jobs_predict_proba_text(b, si, xtf)
+            _run_jobs_ef_dice_text(
+                args, out_root, branch,
+                branch_train_embs[branch], y_train, X_test_static,
+                branch_test_embs[branch],
+                emb_col_names, sample_indices, target_value, label_classes, k,
+                make_pptext,
+            )
+            _run_jobs_ef_nice_text(
+                args, out_root, branch,
+                branch_train_embs[branch], y_train, X_test_static,
+                branch_test_embs[branch],
+                sample_indices, target_value, k,
+                make_pptext,
+            )
+            print(f"[skip] GRADIENT_text_{branch} — gradient not supported for "
+                  "early-fusion strategy")
+        print("[skip] GRADIENT_tabular — gradient not supported for early-fusion strategy")
+
+    else:  # late
+        # ---- Late fusion path ----
+        print("[skip] DiCE_text_* / NICE_text_* — late fusion non-deep text model")
+        print("[skip] GRADIENT_tabular / GRADIENT_text_* — non-deep strategy")
+
+        # Load late-fusion tabular MLP: Linear(108→128)→ReLU→Dropout→Linear(128→64)→ReLU→Dropout→Linear(64→2)
+        lf_tab_ckpt = torch.load(data_dir / "best_model_late_fusion_mlp_tabular.pt", map_location="cpu")
+        lf_sd = {k.removeprefix("net."): v for k, v in lf_tab_ckpt["state_dict"].items()}
+        d_in  = lf_sd["0.weight"].shape[1]
+        h1    = lf_sd["0.weight"].shape[0]
+        h2    = lf_sd["3.weight"].shape[0]
+        n_cls = lf_sd["6.weight"].shape[0]
+        import torch.nn as _nn
+        lf_tab_model = _nn.Sequential(
+            _nn.Linear(d_in, h1), _nn.ReLU(), _nn.Dropout(),
+            _nn.Linear(h1, h2),  _nn.ReLU(), _nn.Dropout(),
+            _nn.Linear(h2, n_cls),
+        ).to(device)
+        lf_tab_model.load_state_dict(lf_sd)
+        lf_tab_model.eval()
+        lf_label_classes = lf_tab_ckpt["label_classes"]
+
+        def _make_lf_jobs_predict_proba_tab(sample_idx, x_tab_factual):
+            def predict_proba_tab(arr: np.ndarray) -> np.ndarray:
+                x_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                with torch.no_grad():
+                    logits = lf_tab_model(x_t)
+                    probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                return probs
+            return predict_proba_tab
+
+        _run_jobs_ef_dice_tabular(
+            args, out_root,
+            X_train_static, y_train, X_test_static,
+            tab_col_names, continuous_tab, categorical_tab, tab_lof,
+            sample_indices, target_value, lf_label_classes, k,
+            _make_lf_jobs_predict_proba_tab,
+        )
+        _run_jobs_ef_nice_tabular(
+            args, out_root,
+            X_train_static, y_train, X_test_static,
+            tab_lof, sample_indices, target_value, k,
+            _make_lf_jobs_predict_proba_tab,
+        )
+
+
+def _run_jobs_ef_dice_tabular(
+    args, out_root,
+    X_train_static, y_train, X_test_static,
+    tab_col_names, continuous_tab, categorical_tab, tab_lof,
+    sample_indices, target_value, label_classes, k,
+    make_predict_proba_tab,
+):
+    """DiCE_tabular for jobs early fusion using a factory predict_proba."""
+    name = "DiCE_tabular"
+    print(f"\n[jobs] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        predict_proba_tab = make_predict_proba_tab(sample_idx, x_tab_factual)
+        cfs, converged = run_dice_on_features(
+            X_train=X_train_static, y_train=y_train,
+            col_names=tab_col_names,
+            continuous_cols=continuous_tab, categorical_cols=categorical_tab,
+            x_query=x_tab_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_tab,
+            k=k, sample_size=args.dice_sample_size, random_seed=args.dice_seed,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for x_cf in cfs:
+            obj_accum.append(compute_tabular_objectives(
+                x_cf, x_tab_factual, tab_lof, predict_proba_tab, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="real_or_fake_jobs",
+        method="dice_random", modality="tabular",
+        held_fixed=["text_description", "text_company_profile", "text_requirements"],
+        embedding_space=False,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
     )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}")
+
+
+def _run_jobs_ef_nice_tabular(
+    args, out_root,
+    X_train_static, y_train, X_test_static,
+    tab_lof, sample_indices, target_value, k,
+    make_predict_proba_tab,
+):
+    """NICE_tabular for jobs early fusion using a factory predict_proba."""
+    name = "NICE_tabular"
+    print(f"\n[jobs] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts: Dict[str, int] = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        predict_proba_tab = make_predict_proba_tab(sample_idx, x_tab_factual)
+        cfs, converged = run_nice(
+            X_train=X_train_static, y_train=y_train,
+            x_query=x_tab_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_tab, k=k,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for x_cf in cfs:
+            obj_accum.append(compute_tabular_objectives(
+                x_cf, x_tab_factual, tab_lof, predict_proba_tab, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="real_or_fake_jobs",
+        method="nice", modality="tabular",
+        held_fixed=["text_description", "text_company_profile", "text_requirements"],
+        embedding_space=False,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}")
+
+
+def _run_jobs_ef_dice_text(
+    args, out_root, branch_name,
+    X_train_emb, y_train, X_test_static, X_test_emb,
+    emb_col_names, sample_indices, target_value, label_classes, k,
+    make_predict_proba_text,
+):
+    """DiCE_text_<branch> for jobs early fusion using a factory predict_proba."""
+    name = f"DiCE_text_{branch_name}"
+    other_branches = [b for b in ("description", "company_profile", "requirements")
+                      if b != branch_name]
+    print(f"\n[jobs] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        emb_factual   = X_test_emb[sample_idx]
+        predict_proba_emb = make_predict_proba_text(sample_idx, x_tab_factual)
+        cfs, converged = run_dice_embedding_fast(
+            X_train=X_train_emb, y_train=y_train,
+            x_query=emb_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_emb,
+            k=k, sample_size=args.dice_sample_size, random_seed=args.dice_seed,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for emb_cf in cfs:
+            obj_accum.append(compute_embedding_objectives(
+                emb_cf, emb_factual, predict_proba_emb, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    other_held = [f"text_{b}" for b in other_branches] + ["tabular"]
+    payload = make_summary_payload(
+        baseline_name=name, dataset="real_or_fake_jobs",
+        method="dice_random", modality=f"text_{branch_name}",
+        held_fixed=other_held, embedding_space=True,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+        notes=(
+            f"Result is a perturbed early-fusion text embedding for the '{branch_name}' "
+            "field, NOT actual text. Other branches and tabular are held fixed. "
+            "Proximity/sparsity in embedding space."
+        ),
+    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}")
+
+
+def _run_jobs_ef_nice_text(
+    args, out_root, branch_name,
+    X_train_emb, y_train, X_test_static, X_test_emb,
+    sample_indices, target_value, k,
+    make_predict_proba_text,
+):
+    """NICE_text_<branch> for jobs early fusion using a factory predict_proba."""
+    name = f"NICE_text_{branch_name}"
+    other_branches = [b for b in ("description", "company_profile", "requirements")
+                      if b != branch_name]
+    print(f"\n[jobs] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        x_tab_factual = X_test_static[sample_idx]
+        emb_factual   = X_test_emb[sample_idx]
+        predict_proba_emb = make_predict_proba_text(sample_idx, x_tab_factual)
+        cfs, converged = run_nice(
+            X_train=X_train_emb, y_train=y_train,
+            x_query=emb_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_emb, k=k,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for emb_cf in cfs:
+            obj_accum.append(compute_embedding_objectives(
+                emb_cf, emb_factual, predict_proba_emb, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    other_held = [f"text_{b}" for b in other_branches] + ["tabular"]
+    payload = make_summary_payload(
+        baseline_name=name, dataset="real_or_fake_jobs",
+        method="nice", modality=f"text_{branch_name}",
+        held_fixed=other_held, embedding_space=True,
+        sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+        notes=(
+            f"Result is a perturbed early-fusion text embedding for the '{branch_name}' "
+            "field, NOT actual text. Other branches and tabular are held fixed. "
+            "Proximity/sparsity in embedding space."
+        ),
+    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}")
 
 
 def _run_jobs_dice_tabular(
@@ -1309,8 +2191,18 @@ def _run_jobs_nice_text(
 def run_memes_baselines(args: argparse.Namespace) -> None:
     dataset_dir = _ROOT / "memes"
     data_dir    = dataset_dir / "data"
-    out_root    = Path(args.output_dir) if args.output_dir else data_dir / "baselines"
+    fusion_strategy = getattr(args, "fusion_strategy", "intermediate")
     device      = _resolve_device(args.gpu)
+
+    # Determine output root per fusion strategy
+    if args.output_dir:
+        out_root = Path(args.output_dir)
+    elif fusion_strategy == "intermediate":
+        out_root = data_dir / "baselines"
+    elif fusion_strategy == "early":
+        out_root = data_dir / "baselines_fusion_early"
+    else:  # late
+        out_root = data_dir / "baselines_fusion_late"
 
     sys.path.insert(0, str(dataset_dir))
     from encoder_features import (  # type: ignore
@@ -1333,146 +2225,436 @@ def run_memes_baselines(args: argparse.Namespace) -> None:
     y_test        = npz["y_test"].astype(int)
     label_classes = npz["label_classes"].tolist()
 
-    # ---- Load model ----
-    ckpt = torch.load(data_dir / "best_model.pt", map_location="cpu")
-    cfg  = ckpt["config"]
-    model = FineTuneMultimodalClassifier(
-        text_encoder_name = cfg["text_encoder"],
-        image_encoder_name = cfg["image_encoder"],
-        n_classes          = len(ckpt["label_classes"]),
-        text_hidden_dim    = cfg["text_hidden_dim"],
-        img_hidden_dim     = cfg["img_hidden_dim"],
-        dropout            = cfg["dropout"],
-        device             = device,
-        word2vec_path      = cfg.get("word2vec_path"),
-        word2vec_vocab_tokens = cfg.get("word2vec_vocab_tokens"),
-    ).to(device)
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-
-    text_enc_name = cfg["text_encoder"]
-    img_enc_name  = cfg["image_encoder"]
-    text_cfg      = TEXT_ENCODERS.get(text_enc_name, {})
-    text_dim      = text_cfg.get("feature_dim", 768)
-    img_dim       = IMAGE_ENCODERS.get(img_enc_name, {})["feature_dim"]
-
     # ---- Sample indices (hateful → not hateful) ----
     target_value = args.target_value
     if target_value is None:
         target_value = (label_classes.index("not_hateful")
                         if "not_hateful" in label_classes else 0)
 
-    y_pred_path = data_dir / "y_pred.npy"
+    _memes_pred_file = {
+        "intermediate": "y_pred.npy",
+        "early":        "y_pred_early_fusion_gbt.npy",
+        "late":         "y_pred_late_fusion_nondp.npy",
+    }.get(fusion_strategy, "y_pred.npy")
+    y_pred_path = data_dir / _memes_pred_file
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else y_test
     if args.sample_indices:
         sample_indices = _parse_csv_indices(args.sample_indices)
     else:
         source_class = 1 - target_value
         sample_indices = _select_source_samples(
-            y_pred, y_test, source_class, args.max_samples
+            y_pred, source_class, args.max_samples
         )
 
     k = args.k
-    print(f"[memes] {len(sample_indices)} samples → target={label_classes[target_value]}")
+    print(f"[memes] {len(sample_indices)} samples → target={label_classes[target_value]}"
+          f"  fusion_strategy={fusion_strategy}")
 
-    # ---- Pre-compute text embeddings (raw encoder output) ----
-    print(f"[memes] Encoding text ({text_enc_name}) …")
-    if text_enc_name == "word2vec":
-        # word2vec path — not supported for embedding-space DiCE (fixed vocab)
-        print("[memes] word2vec encoder: embedding-space baseline not supported. "
-              "Re-run with a transformer-based encoder checkpoint.")
-        return
+    if fusion_strategy == "intermediate":
+        # ---- Existing intermediate-fusion path ----
+        ckpt = torch.load(data_dir / "best_model.pt", map_location="cpu")
+        cfg  = ckpt["config"]
+        model = FineTuneMultimodalClassifier(
+            text_encoder_name = cfg["text_encoder"],
+            image_encoder_name = cfg["image_encoder"],
+            n_classes          = len(ckpt["label_classes"]),
+            text_hidden_dim    = cfg["text_hidden_dim"],
+            img_hidden_dim     = cfg["img_hidden_dim"],
+            dropout            = cfg["dropout"],
+            device             = device,
+            word2vec_path      = cfg.get("word2vec_path"),
+            word2vec_vocab_tokens = cfg.get("word2vec_vocab_tokens"),
+        ).to(device)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
 
-    tokenizer, text_encoder, _ = build_text_backend(text_enc_name, device)
-    pooling   = text_cfg.get("pooling", "cls")
-    normalize = text_cfg.get("normalize", False)
-    X_train_text_emb = _encode_texts_batch(
-        X_train_text, tokenizer, text_encoder, device,
-        max_len=cfg.get("max_len", 128), pooling=pooling, normalize=normalize,
-    )
-    X_test_text_emb = _encode_texts_batch(
-        X_test_text, tokenizer, text_encoder, device,
-        max_len=cfg.get("max_len", 128), pooling=pooling, normalize=normalize,
-    )
-    text_emb_cols = _build_emb_col_names(text_dim)
+        text_enc_name = cfg["text_encoder"]
+        img_enc_name  = cfg["image_encoder"]
+        text_cfg      = TEXT_ENCODERS.get(text_enc_name, {})
+        text_dim      = text_cfg.get("feature_dim", 768)
+        img_dim       = IMAGE_ENCODERS.get(img_enc_name, {})["feature_dim"]
 
-    # ---- Pre-compute image embeddings (raw encoder output) ----
-    print(f"[memes] Encoding images ({img_enc_name}) …")
-    img_encoder, img_transform = build_image_backend(img_enc_name, device)
-    X_train_img_emb = _encode_images_batch(
-        X_train_img, img_encoder, img_transform, device
-    )
-    X_test_img_emb = _encode_images_batch(
-        X_test_img, img_encoder, img_transform, device
-    )
-    img_emb_cols = _build_emb_col_names(img_dim)
+        if text_enc_name == "word2vec":
+            print("[memes] word2vec encoder: embedding-space baseline not supported. "
+                  "Re-run with a transformer-based encoder checkpoint.")
+            return
 
-    # Pre-project test embeddings (proj layers for fixed-modality branches)
-    X_test_txt_t = torch.tensor(X_test_text_emb, dtype=torch.float32).to(device)
-    X_test_img_t = torch.tensor(X_test_img_emb,  dtype=torch.float32).to(device)
-    with torch.no_grad():
-        text_proj_embs_test = model.text_proj(X_test_txt_t).cpu().numpy()
-        img_proj_embs_test  = model.img_proj(X_test_img_t).cpu().numpy()
+        tokenizer, text_encoder, _ = build_text_backend(text_enc_name, device)
+        pooling   = text_cfg.get("pooling", "cls")
+        normalize = text_cfg.get("normalize", False)
+        X_train_text_emb = _encode_texts_batch(
+            X_train_text, tokenizer, text_encoder, device,
+            max_len=cfg.get("max_len", 128), pooling=pooling, normalize=normalize,
+        )
+        X_test_text_emb = _encode_texts_batch(
+            X_test_text, tokenizer, text_encoder, device,
+            max_len=cfg.get("max_len", 128), pooling=pooling, normalize=normalize,
+        )
+        text_emb_cols = _build_emb_col_names(text_dim)
 
-    # ===================================================================
-    # Baselines: DiCE_text_meme_text / NICE_text_meme_text
-    # ===================================================================
-    _run_memes_dice_emb(
-        args, out_root, device, model, "meme_text",
-        X_train_text_emb, y_train, X_test_text_emb,
-        text_emb_cols,
-        img_proj_embs_test,
-        model.text_proj, model.img_proj,
-        is_text=True,
-        sample_indices=sample_indices, target_value=target_value,
-        label_classes=label_classes, k=k,
-    )
-    _run_memes_nice_emb(
-        args, out_root, device, model, "meme_text",
-        X_train_text_emb, y_train, X_test_text_emb,
-        img_proj_embs_test,
-        model.text_proj,
-        is_text=True,
+        img_encoder, img_transform = build_image_backend(img_enc_name, device)
+        X_train_img_emb = _encode_images_batch(X_train_img, img_encoder, img_transform, device)
+        X_test_img_emb  = _encode_images_batch(X_test_img,  img_encoder, img_transform, device)
+        img_emb_cols = _build_emb_col_names(img_dim)
+
+        X_test_txt_t = torch.tensor(X_test_text_emb, dtype=torch.float32).to(device)
+        X_test_img_t = torch.tensor(X_test_img_emb,  dtype=torch.float32).to(device)
+        with torch.no_grad():
+            text_proj_embs_test = model.text_proj(X_test_txt_t).cpu().numpy()
+            img_proj_embs_test  = model.img_proj(X_test_img_t).cpu().numpy()
+
+        _run_memes_dice_emb(
+            args, out_root, device, model, "meme_text",
+            X_train_text_emb, y_train, X_test_text_emb,
+            text_emb_cols, img_proj_embs_test,
+            model.text_proj, model.img_proj, is_text=True,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+        )
+        _run_memes_nice_emb(
+            args, out_root, device, model, "meme_text",
+            X_train_text_emb, y_train, X_test_text_emb,
+            img_proj_embs_test, model.text_proj, is_text=True,
+            sample_indices=sample_indices, target_value=target_value, k=k,
+        )
+        _run_memes_gradient_emb(
+            args, out_root, device, model, "meme_text",
+            X_train_text_emb, y_train, X_test_text_emb,
+            img_proj_embs_test, model.text_proj, is_text=True,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+        )
+        _run_memes_dice_emb(
+            args, out_root, device, model, "meme_img",
+            X_train_img_emb, y_train, X_test_img_emb,
+            img_emb_cols, text_proj_embs_test,
+            model.img_proj, model.text_proj, is_text=False,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+        )
+        _run_memes_nice_emb(
+            args, out_root, device, model, "meme_img",
+            X_train_img_emb, y_train, X_test_img_emb,
+            text_proj_embs_test, model.img_proj, is_text=False,
+            sample_indices=sample_indices, target_value=target_value, k=k,
+        )
+        _run_memes_gradient_emb(
+            args, out_root, device, model, "meme_img",
+            X_train_img_emb, y_train, X_test_img_emb,
+            text_proj_embs_test, model.img_proj, is_text=False,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+        )
+
+    elif fusion_strategy == "early":
+        # ---- Early fusion path ----
+        # Load early-fusion MLP; use precomputed text+image embeddings
+        ef_ckpt = torch.load(data_dir / "best_model_early_fusion_mlp.pt", map_location="cpu")
+        ef_cfg   = ef_ckpt["config"]
+        # config keys: text_encoder, image_encoder, d_in
+        text_enc_name = ef_cfg.get("text_encoder", "bert")
+        img_enc_name  = ef_cfg.get("image_encoder", "resnet50")
+        ef_d_in   = ef_cfg.get("d_in", ef_ckpt.get("d_in", 2816))
+        label_classes = ef_ckpt.get("label_classes", label_classes)
+        ef_n_cls  = len(label_classes)
+        ef_hidden = ef_cfg.get("hidden", 256) if isinstance(ef_cfg, dict) else 256
+        ef_dropout = ef_cfg.get("dropout", 0.3) if isinstance(ef_cfg, dict) else 0.3
+        ef_depth = _EarlyFusionMLP.depth_from_state_dict(ef_ckpt["state_dict"])
+        ef_model  = _EarlyFusionMLP(ef_d_in, ef_n_cls, ef_hidden, ef_dropout, depth=ef_depth).to(device)
+        ef_model.load_state_dict(ef_ckpt["state_dict"])
+        ef_model.eval()
+
+        print("[memes] Loading precomputed embeddings for early fusion …")
+        emb_data = torch.load(data_dir / "precomputed_embeddings.pt", map_location="cpu")
+        # structure: {text: {bert: {train:(n,768), test:(n,768)}},
+        #             image: {resnet50: {train:(n,2048), test:(n,2048)}}}
+        X_train_text_emb = emb_data["text"][text_enc_name]["train"].numpy().astype(np.float32)
+        X_test_text_emb  = emb_data["text"][text_enc_name]["test"].numpy().astype(np.float32)
+        X_train_img_emb  = emb_data["image"][img_enc_name]["train"].numpy().astype(np.float32)
+        X_test_img_emb   = emb_data["image"][img_enc_name]["test"].numpy().astype(np.float32)
+        text_dim = X_train_text_emb.shape[1]
+        img_dim  = X_train_img_emb.shape[1]
+        text_emb_cols = _build_emb_col_names(text_dim)
+        img_emb_cols  = _build_emb_col_names(img_dim)
+
+        # EF predict_proba factories
+        def _make_ef_memes_predict_proba_text(sample_idx, x_tab_factual):
+            img_fixed = torch.tensor(
+                X_test_img_emb[sample_idx][np.newaxis, :], dtype=torch.float32
+            ).to(device)
+            def predict_proba_emb(arr: np.ndarray) -> np.ndarray:
+                emb_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                B = emb_t.size(0)
+                inp = torch.cat([emb_t, img_fixed.expand(B, -1)], dim=1)
+                with torch.no_grad():
+                    logits = ef_model(inp)
+                    return torch.softmax(logits, dim=1).cpu().numpy()
+            return predict_proba_emb
+
+        def _make_ef_memes_predict_proba_image(sample_idx, x_tab_factual):
+            txt_fixed = torch.tensor(
+                X_test_text_emb[sample_idx][np.newaxis, :], dtype=torch.float32
+            ).to(device)
+            def predict_proba_emb(arr: np.ndarray) -> np.ndarray:
+                emb_t = torch.tensor(arr, dtype=torch.float32).to(device)
+                B = emb_t.size(0)
+                inp = torch.cat([txt_fixed.expand(B, -1), emb_t], dim=1)
+                with torch.no_grad():
+                    logits = ef_model(inp)
+                    return torch.softmax(logits, dim=1).cpu().numpy()
+            return predict_proba_emb
+
+        _run_memes_ef_dice_emb(
+            args, out_root, "meme_text", is_text=True,
+            X_train_emb=X_train_text_emb, y_train=y_train,
+            X_test_emb=X_test_text_emb,
+            emb_col_names=text_emb_cols,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+            make_predict_proba=_make_ef_memes_predict_proba_text,
+        )
+        _run_memes_ef_nice_emb(
+            args, out_root, "meme_text", is_text=True,
+            X_train_emb=X_train_text_emb, y_train=y_train,
+            X_test_emb=X_test_text_emb,
+            sample_indices=sample_indices, target_value=target_value, k=k,
+            make_predict_proba=_make_ef_memes_predict_proba_text,
+        )
+        _run_memes_ef_dice_emb(
+            args, out_root, "meme_img", is_text=False,
+            X_train_emb=X_train_img_emb, y_train=y_train,
+            X_test_emb=X_test_img_emb,
+            emb_col_names=img_emb_cols,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+            make_predict_proba=_make_ef_memes_predict_proba_image,
+        )
+        _run_memes_ef_nice_emb(
+            args, out_root, "meme_img", is_text=False,
+            X_train_emb=X_train_img_emb, y_train=y_train,
+            X_test_emb=X_test_img_emb,
+            sample_indices=sample_indices, target_value=target_value, k=k,
+            make_predict_proba=_make_ef_memes_predict_proba_image,
+        )
+        print("[skip] GRADIENT_text_meme_text / GRADIENT_image_meme_img — "
+              "gradient not supported for early-fusion strategy")
+
+    else:  # late
+        # ---- Late fusion path ----
+        # RF models for text and image; predict_proba by averaging both branches
+        import pickle
+
+        text_rf_path  = data_dir / "best_model_late_fusion_rf_text.pkl"
+        image_rf_path = data_dir / "best_model_late_fusion_rf_image.pkl"
+
+        def _load_rf_dict(path):
+            try:
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"[memes] Warning: failed to load {path.name} ({e})")
+                return None
+
+        text_rf_dict  = _load_rf_dict(text_rf_path)  if text_rf_path.exists()  else None
+        image_rf_dict = _load_rf_dict(image_rf_path) if image_rf_path.exists() else None
+
+        if text_rf_dict is None or image_rf_dict is None:
+            print("[memes] late fusion: one or both RF models unavailable; skipping all baselines")
+            return
+
+        text_enc_name  = text_rf_dict.get("encoder", "bert")
+        image_enc_name = image_rf_dict.get("encoder", "resnet50")
+        text_rf  = text_rf_dict["model"]
+        image_rf = image_rf_dict["model"]
+        label_classes = text_rf_dict.get("label_classes", label_classes)
+
+        # Load precomputed embeddings
+        print("[memes] Loading precomputed embeddings for late fusion …")
+        emb_data = torch.load(data_dir / "precomputed_embeddings.pt", map_location="cpu")
+        X_train_text_emb = emb_data["text"][text_enc_name]["train"].numpy().astype(np.float32)
+        X_test_text_emb  = emb_data["text"][text_enc_name]["test"].numpy().astype(np.float32)
+        X_train_img_emb  = emb_data["image"][image_enc_name]["train"].numpy().astype(np.float32)
+        X_test_img_emb   = emb_data["image"][image_enc_name]["test"].numpy().astype(np.float32)
+        text_dim = X_train_text_emb.shape[1]
+        img_dim  = X_train_img_emb.shape[1]
+        text_emb_cols = _build_emb_col_names(text_dim)
+        img_emb_cols  = _build_emb_col_names(img_dim)
+
+        # Average both RF branch predictions
+        def _make_late_memes_predict_proba_text(sample_idx, x_tab_factual):
+            img_fixed = X_test_img_emb[sample_idx][np.newaxis, :]  # (1, img_dim)
+            def predict_proba_emb(arr: np.ndarray) -> np.ndarray:
+                p_text = text_rf.predict_proba(arr)
+                # replicate image prediction for batch
+                p_img  = image_rf.predict_proba(
+                    np.tile(img_fixed, (arr.shape[0], 1))
+                )
+                return ((p_text + p_img) / 2.0).astype(np.float32)
+            return predict_proba_emb
+
+        def _make_late_memes_predict_proba_image(sample_idx, x_tab_factual):
+            txt_fixed = X_test_text_emb[sample_idx][np.newaxis, :]
+            def predict_proba_emb(arr: np.ndarray) -> np.ndarray:
+                p_img  = image_rf.predict_proba(arr)
+                p_text = text_rf.predict_proba(
+                    np.tile(txt_fixed, (arr.shape[0], 1))
+                )
+                return ((p_text + p_img) / 2.0).astype(np.float32)
+            return predict_proba_emb
+
+        _run_memes_ef_dice_emb(
+            args, out_root, "meme_text", is_text=True,
+            X_train_emb=X_train_text_emb, y_train=y_train,
+            X_test_emb=X_test_text_emb,
+            emb_col_names=text_emb_cols,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+            make_predict_proba=_make_late_memes_predict_proba_text,
+        )
+        _run_memes_ef_nice_emb(
+            args, out_root, "meme_text", is_text=True,
+            X_train_emb=X_train_text_emb, y_train=y_train,
+            X_test_emb=X_test_text_emb,
+            sample_indices=sample_indices, target_value=target_value, k=k,
+            make_predict_proba=_make_late_memes_predict_proba_text,
+        )
+        _run_memes_ef_dice_emb(
+            args, out_root, "meme_img", is_text=False,
+            X_train_emb=X_train_img_emb, y_train=y_train,
+            X_test_emb=X_test_img_emb,
+            emb_col_names=img_emb_cols,
+            sample_indices=sample_indices, target_value=target_value,
+            label_classes=label_classes, k=k,
+            make_predict_proba=_make_late_memes_predict_proba_image,
+        )
+        _run_memes_ef_nice_emb(
+            args, out_root, "meme_img", is_text=False,
+            X_train_emb=X_train_img_emb, y_train=y_train,
+            X_test_emb=X_test_img_emb,
+            sample_indices=sample_indices, target_value=target_value, k=k,
+            make_predict_proba=_make_late_memes_predict_proba_image,
+        )
+        print("[skip] GRADIENT_text_meme_text / GRADIENT_image_meme_img — "
+              "gradient not supported for non-deep RF strategy")
+
+
+def _run_memes_ef_dice_emb(
+    args, out_root, modality_name, is_text: bool,
+    X_train_emb, y_train, X_test_emb,
+    emb_col_names, sample_indices, target_value, label_classes, k,
+    make_predict_proba,
+    X_test_static=None,
+):
+    """DiCE embedding baseline for memes early/late fusion using a factory predict_proba."""
+    mod_type = "text" if is_text else "image"
+    name = f"DiCE_{mod_type}_{modality_name}"
+    held = "image_meme_img" if is_text else "text_meme_text"
+    print(f"\n[memes] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        emb_factual = X_test_emb[sample_idx]
+        x_tab_factual = (X_test_static[sample_idx]
+                         if X_test_static is not None else np.zeros(1, dtype=np.float32))
+        predict_proba_emb = make_predict_proba(sample_idx, x_tab_factual)
+        cfs, converged = run_dice_embedding_fast(
+            X_train=X_train_emb, y_train=y_train,
+            x_query=emb_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_emb,
+            k=k, sample_size=args.dice_sample_size, random_seed=args.dice_seed,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for emb_cf in cfs:
+            obj_accum.append(compute_embedding_objectives(
+                emb_cf, emb_factual, predict_proba_emb, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="hateful_memes",
+        method="dice_random", modality=f"{mod_type}_{modality_name}",
+        held_fixed=[held], embedding_space=True,
         sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+        notes=(
+            f"Result is a perturbed {mod_type}-encoder embedding, NOT actual "
+            f"{'text or image' if mod_type == 'text' else 'image or text'}. "
+            f"The {held} branch is held fixed at factual value. "
+            "Proximity/sparsity in embedding space. Plausibility is NaN."
+        ),
     )
-    _run_memes_gradient_emb(
-        args, out_root, device, model, "meme_text",
-        X_train_text_emb, y_train, X_test_text_emb,
-        img_proj_embs_test,
-        model.text_proj, is_text=True,
-        sample_indices=sample_indices, target_value=target_value,
-        label_classes=label_classes, k=k,
-    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}")
 
-    # ===================================================================
-    # Baselines: DiCE_image_meme_img / NICE_image_meme_img / GRADIENT_image_meme_img
-    # ===================================================================
-    _run_memes_dice_emb(
-        args, out_root, device, model, "meme_img",
-        X_train_img_emb, y_train, X_test_img_emb,
-        img_emb_cols,
-        text_proj_embs_test,
-        model.img_proj, model.text_proj,
-        is_text=False,
-        sample_indices=sample_indices, target_value=target_value,
-        label_classes=label_classes, k=k,
-    )
-    _run_memes_nice_emb(
-        args, out_root, device, model, "meme_img",
-        X_train_img_emb, y_train, X_test_img_emb,
-        text_proj_embs_test,
-        model.img_proj,
-        is_text=False,
+
+def _run_memes_ef_nice_emb(
+    args, out_root, modality_name, is_text: bool,
+    X_train_emb, y_train, X_test_emb,
+    sample_indices, target_value, k,
+    make_predict_proba,
+    X_test_static=None,
+):
+    """NICE embedding baseline for memes early/late fusion using a factory predict_proba."""
+    mod_type = "text" if is_text else "image"
+    name = f"NICE_{mod_type}_{modality_name}"
+    held = "image_meme_img" if is_text else "text_meme_text"
+    print(f"\n[memes] Running {name} (factory) …")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    obj_accum: List[np.ndarray] = []
+    n_converged = 0
+    candidate_counts = {name: 0}
+
+    for idx, sample_idx in enumerate(sample_indices):
+        emb_factual = X_test_emb[sample_idx]
+        x_tab_factual = (X_test_static[sample_idx]
+                         if X_test_static is not None else np.zeros(1, dtype=np.float32))
+        predict_proba_emb = make_predict_proba(sample_idx, x_tab_factual)
+        cfs, converged = run_nice(
+            X_train=X_train_emb, y_train=y_train,
+            x_query=emb_factual, target_value=target_value,
+            predict_proba_fn=predict_proba_emb, k=k,
+        )
+        if converged:
+            n_converged += 1
+        candidate_counts[name] += len(cfs)
+        for emb_cf in cfs:
+            obj_accum.append(compute_embedding_objectives(
+                emb_cf, emb_factual, predict_proba_emb, target_value
+            ))
+        if (idx + 1) % 10 == 0 or idx + 1 == len(sample_indices):
+            print(f"  {idx+1}/{len(sample_indices)} samples  converged={n_converged}/{idx+1}")
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    payload = make_summary_payload(
+        baseline_name=name, dataset="hateful_memes",
+        method="nice", modality=f"{mod_type}_{modality_name}",
+        held_fixed=[held], embedding_space=True,
         sample_indices=sample_indices, target_value=target_value, k=k,
+        objectives_by_generator={name: aggregate_objectives(obj_accum)},
+        candidate_counts=candidate_counts,
+        n_converged=n_converged, n_total=len(sample_indices),
+        runtime_sec=(finished_at - started_at).total_seconds(),
+        started_at=started_at, finished_at=finished_at,
+        notes=(
+            f"Result is a perturbed {mod_type}-encoder embedding, NOT actual "
+            f"{'text' if mod_type == 'text' else 'image'}. "
+            f"The {held} branch is held fixed at factual value. "
+            "Proximity/sparsity in embedding space. Plausibility is NaN."
+        ),
     )
-    _run_memes_gradient_emb(
-        args, out_root, device, model, "meme_img",
-        X_train_img_emb, y_train, X_test_img_emb,
-        text_proj_embs_test,
-        model.img_proj, is_text=False,
-        sample_indices=sample_indices, target_value=target_value,
-        label_classes=label_classes, k=k,
-    )
+    path = write_summary(payload, out_root / name)
+    print(f"  → {path}")
 
 
 def _run_memes_dice_emb(
@@ -1637,16 +2819,63 @@ def _run_memes_nice_emb(
 # Sepsis baselines
 # ===========================================================================
 
+def _load_sepsis_model_for_strategy(
+    data_dir: Path, fold: int, fusion_strategy: str, device: str
+) -> Tuple[nn.Module, bool]:
+    """Load the appropriate Sepsis model for the given fusion strategy.
+
+    Returns (model, is_deep) where is_deep indicates whether gradient-based
+    baselines are supported.
+    """
+    if fusion_strategy == "intermediate":
+        # Default: existing early-fusion model (called "intermediate/best" historically)
+        model_path = data_dir / f"best_model_{fold}.pt"
+        model = _load_sepsis_model(model_path, device)
+        return model, True
+
+    if fusion_strategy == "early":
+        # Same early-fusion SepsisModel — just named best_model_{fold}.pt
+        model_path = data_dir / f"best_model_{fold}.pt"
+        model = _load_sepsis_model(model_path, device)
+        return model, True
+
+    if fusion_strategy == "late":
+        # Late fusion: average of TSOnly + StaticOnly
+        import pickle
+        ts_path     = data_dir / f"best_model_late_fusion_mlp_ts_fold{fold}.pt"
+        static_path = data_dir / f"best_model_late_fusion_mlp_static_fold{fold}.pt"
+        ts_m = _SepsisTSModel()
+        ts_m.load_state_dict(torch.load(ts_path, map_location="cpu"))
+        static_m = _SepsisStaticModel()
+        static_m.load_state_dict(torch.load(static_path, map_location="cpu"))
+        model = _SepsisLateWrapper(ts_m, static_m).to(device)
+        model.eval()
+        return model, True
+
+    raise ValueError(f"Unknown fusion_strategy: {fusion_strategy!r}")
+
+
 def run_sepsis_baselines(args: argparse.Namespace) -> None:
     dataset_dir = _ROOT / "sepsis"
     data_dir    = dataset_dir / "data"
     fold        = args.fold
     fold_dir    = data_dir / f"fold_{fold}"
-    out_root    = Path(args.output_dir) if args.output_dir else data_dir / "baselines" / f"fold_{fold}"
+    fusion_strategy = getattr(args, "fusion_strategy", "intermediate")
     device      = _resolve_device(args.gpu)
     ts_name     = "lab_exams_vitals"
 
-    print(f"[sepsis] Fold {fold} — device={device}")
+    # Determine output root per fusion strategy
+    if args.output_dir:
+        out_root = Path(args.output_dir)
+    elif fusion_strategy == "intermediate":
+        # Preserve existing default path (backward compat)
+        out_root = data_dir / "baselines" / f"fold_{fold}"
+    elif fusion_strategy == "early":
+        out_root = data_dir / "baselines_fusion_early" / f"fold_{fold}"
+    else:  # late
+        out_root = data_dir / "baselines_fusion_late" / f"fold_{fold}"
+
+    print(f"[sepsis] Fold {fold} — device={device}  fusion_strategy={fusion_strategy}")
 
     # ---- Load data ----
     X_train_static = np.load(fold_dir / "X_train_static.npy").astype(np.float32)
@@ -1656,9 +2885,10 @@ def run_sepsis_baselines(args: argparse.Namespace) -> None:
     y_train        = np.load(fold_dir / "y_train.npy").astype(int)
     y_test         = np.load(fold_dir / "y_test.npy").astype(int)
 
-    # ---- Load model ----
-    model_path = data_dir / f"best_model_{fold}.pt"
-    model = _load_sepsis_model(model_path, device)
+    # ---- Load strategy-specific model ----
+    model, is_deep = _load_sepsis_model_for_strategy(
+        data_dir, fold, fusion_strategy, device
+    )
 
     # Feature dimension names for tabular features
     D_static  = X_train_static.shape[1]
@@ -1670,14 +2900,19 @@ def run_sepsis_baselines(args: argparse.Namespace) -> None:
     if target_value is None:
         target_value = label_classes.index("no_death")
 
-    y_pred_path = fold_dir / "y_pred.npy"
+    _sepsis_pred_file = {
+        "early":        "y_pred.npy",
+        "intermediate": "y_pred_intermediate_rf.npy",
+        "late":         "y_pred_late_deep.npy",
+    }.get(fusion_strategy, "y_pred.npy")
+    y_pred_path = fold_dir / _sepsis_pred_file
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else y_test
     if args.sample_indices:
         sample_indices = _parse_csv_indices(args.sample_indices)
     else:
         source_class = 1 - target_value
         sample_indices = _select_source_samples(
-            y_pred, y_test, source_class, args.max_samples
+            y_pred, source_class, args.max_samples
         )
 
     k = args.k
@@ -1711,23 +2946,31 @@ def run_sepsis_baselines(args: argparse.Namespace) -> None:
     # ===================================================================
     # Baseline 3: GRADIENT_tabular
     # ===================================================================
-    _run_sepsis_gradient_tab(
-        args, out_root, device, model,
-        X_train_static, y_train, X_test_static, X_test_ts,
-        tab_lof, ts_name, sample_indices, target_value, k, fold,
-    )
+    if is_deep:
+        _run_sepsis_gradient_tab(
+            args, out_root, device, model,
+            X_train_static, y_train, X_test_static, X_test_ts,
+            tab_lof, ts_name, sample_indices, target_value, k, fold,
+        )
+    else:
+        print(f"[skip] GRADIENT_tabular — gradient not supported for non-deep "
+              f"fusion_strategy={fusion_strategy!r}")
 
     # ===================================================================
     # Baseline 4: Gradient-based TS perturbation
     # ===================================================================
-    _run_sepsis_gradient_ts(
-        args, out_root, device, model,
-        X_test_static, X_test_ts,
-        ts_name, sample_indices, target_value, label_classes, k, fold,
-    )
+    if is_deep:
+        _run_sepsis_gradient_ts(
+            args, out_root, device, model,
+            X_test_static, X_test_ts,
+            ts_name, sample_indices, target_value, label_classes, k, fold,
+        )
+    else:
+        print(f"[skip] GRADIENT_TS_{ts_name} — gradient not supported for non-deep "
+              f"fusion_strategy={fusion_strategy!r}")
 
     # ===================================================================
-    # Baseline 4: Native Guide (NativeGuide-ISW)
+    # Baseline 5: Native Guide (NativeGuide-ISW)
     # ===================================================================
     _run_sepsis_native_guide(
         args, out_root, device, model,
@@ -1736,7 +2979,7 @@ def run_sepsis_baselines(args: argparse.Namespace) -> None:
     )
 
     # ===================================================================
-    # Baseline 5: CoMTE greedy segment swap
+    # Baseline 6: CoMTE greedy segment swap
     # ===================================================================
     _run_sepsis_comte(
         args, out_root, device, model,
@@ -2721,7 +3964,9 @@ def _run_sepsis_gradient_tab(
 
 def main() -> None:
     args = _parse_args()
-    print(f"[run_baselines] dataset={args.dataset}  gpu={args.gpu}  k={args.k}")
+    fusion_strategy = getattr(args, "fusion_strategy", "intermediate")
+    print(f"[run_baselines] dataset={args.dataset}  gpu={args.gpu}  k={args.k}"
+          f"  fusion_strategy={fusion_strategy}")
 
     dispatch = {
         "long_covid_tweets": run_long_covid_baselines,

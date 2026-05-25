@@ -42,6 +42,7 @@ def build_tweet_dataset(
     data_dir: Optional[str] = None,
     gpu: Optional[int] = None,
     load_bert: bool = True,
+    fusion_strategy: str = "intermediate",
 ) -> Dict[str, Any]:
     """Load the tweet MultimodalDataset and (optionally) the XLM-RoBERTa text backend.
 
@@ -82,7 +83,12 @@ def build_tweet_dataset(
     )
 
     # ---- predictions (for caller to derive sample_indices / target_value) ----
-    y_pred_path = root / "y_pred.npy"
+    _pred_filename = {
+        "intermediate": "y_pred.npy",
+        "early":        "y_pred_early_fusion_mlp.npy",
+        "late":         "y_pred_late_fusion_tfidf_logreg_nondp.npy",
+    }.get(fusion_strategy, "y_pred.npy")
+    y_pred_path = root / _pred_filename
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else None
 
     # ---- text backend ----

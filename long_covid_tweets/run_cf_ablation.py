@@ -56,6 +56,7 @@ from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import FrankensteinNN, CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN
 from counterfactual_helpers import find_k_closest_latent
+from counterfactual_evaluation_helpers import fit_proximity_normalizer
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -64,9 +65,9 @@ parser = argparse.ArgumentParser(
     description="Sadness→Joy counterfactual ablation on Long COVID tweets."
 )
 parser.add_argument("--gpu",              type=int,   default=7)
-parser.add_argument("--k",               type=int,   default=20,
+parser.add_argument("--k",               type=int,   default=50,
                     help="Number of nearest neighbours per generator (default: 20).")
-parser.add_argument("--max-samples",     type=int,   default=100,
+parser.add_argument("--max-samples",     type=int,   default=None,
                     help="Cap on how many sadness samples to process (default: all).")
 parser.add_argument("--max-combinations",type=int,   default=None,
                     help="Cap on metric combinations to try (default: all).")
@@ -74,7 +75,15 @@ parser.add_argument("--n-jobs",          type=int,   default=1,
                     help="Number of ablation combinations to run in parallel.")
 parser.add_argument("--output-dir",      type=str,   default="data/ablation_runs")
 parser.add_argument("--run-name",        type=str,   default=None)
-parser.add_argument("--save-full",       action="store_true",
+parser.add_argument("--k-search-combined", type=int, default=300,
+                    help="k_search pool size for FrankensteinNN and CombinedNN (default: 300).")
+parser.add_argument("--fusion-strategy", type=str,   default="intermediate",
+                    choices=["intermediate", "early", "late"],
+                    help="Which fusion model to use for predict_fn / latents. "
+                         "intermediate=best_model.pt (default); "
+                         "early=best_model_early_fusion_mlp.pt; "
+                         "late=tfidf_logreg_text + gbt_tabular averaged.")
+parser.add_argument("--save-full",       action="store_true", default=True,
                     help="Save full candidate dicts as .pkl per combination.")
 parser.add_argument("--no-bert",         action="store_true",
                     help="Skip loading the BERT text backend (faster for smoke tests).")
@@ -90,12 +99,31 @@ parser.add_argument("--source-emotion",  type=str,   default="sadness",
                     help="Emotion class to explain (default: sadness).")
 parser.add_argument("--target-emotion",  type=str,   default="joy",
                     help="Counterfactual target emotion (default: joy).")
+parser.add_argument(
+    "--eval-pkls",
+    type=str,
+    default=None,
+    metavar="DIR[,DIR,...]",
+    help=(
+        "Instead of generating new counterfactuals, re-evaluate saved "
+        "combo_*_results.pkl files at multiple k values. "
+        "Comma-separated list of run directories (each containing pkls + "
+        "summary.jsonl). Results are written to <first-dir>/k_ablation_summary.json."
+    ),
+)
+parser.add_argument(
+    "--k-values",
+    type=str,
+    default="1,5,10,20,50",
+    help="Comma-separated k values for --eval-pkls mode (default: 1,5,10,20,50).",
+)
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
 # Load dataset and predictions
 # ---------------------------------------------------------------------------
-produced = build_tweet_dataset(gpu=args.gpu, load_bert=not args.no_bert)
+produced = build_tweet_dataset(gpu=args.gpu, load_bert=not args.no_bert,
+                               fusion_strategy=args.fusion_strategy)
 
 dataset       = produced["dataset"]
 text_bk       = produced["text_backend_kwargs"]
@@ -181,6 +209,12 @@ _tab_lof_low  = float(np.percentile(_tab_lof_train_scores, 5))
 _tab_lof_high = float(np.percentile(_tab_lof_train_scores, 95))
 print(f"  LOF fitted on {len(dataset.X_train_static):,} samples "
       f"(score range [{_tab_lof_low:.3f}, {_tab_lof_high:.3f}])")
+print("Pre-computing proximity reference distribution …")
+_prox_norm = fit_proximity_normalizer(
+    X_tab_obs=dataset.X_train_static,
+    y_train=dataset.y_train,
+)
+print(f"  Proximity ref dists: {len(_prox_norm.get('tab_ref_dists', []))} tabular pairs sampled.")
 
 # ---------------------------------------------------------------------------
 # PyTorch model latent space (for IntermediateFusion generator)
@@ -267,9 +301,10 @@ _torch_latents: Optional[tuple] = None
 _predict_fn: Optional[object] = None
 _predict_fn_lock = threading.Lock()  # serializes live GPU inference (cache-miss path)
 _DATA_DIR = Path(__file__).parent / "data"
+_fusion_strategy = args.fusion_strategy
 _pt_path  = _DATA_DIR / "best_model.pt"
 
-if _pt_path.exists():
+if _fusion_strategy == "intermediate" and _pt_path.exists():
     try:
         import torch
         import torch.nn as _nn
@@ -396,8 +431,143 @@ if _pt_path.exists():
 
     except Exception as _e:
         print(f"[warn] Could not compute model latents — IntermediateFusion will be skipped: {_e}")
-else:
+elif _fusion_strategy == "intermediate":
     print(f"[warn] best_model.pt not found at {_pt_path} — IntermediateFusion will be skipped.")
+
+# ---- Early fusion predict_fn (MLP on frozen XLM-R CLS + tabular) -----------
+if _fusion_strategy == "early":
+    _ef_path = _DATA_DIR / "best_model_early_fusion_mlp.pt"
+    _ef_emb_path = _DATA_DIR / "early_fusion_text_embeddings.pt"
+    if _ef_path.exists() and _ef_emb_path.exists():
+        try:
+            import torch as _t
+            import torch.nn as _nn
+
+            class _EarlyFusionMLP(_nn.Module):
+                def __init__(self, d_in, n_classes, hidden, dropout):
+                    super().__init__()
+                    self.net = _nn.Sequential(
+                        _nn.Linear(d_in, hidden), _nn.ReLU(), _nn.Dropout(dropout),
+                        _nn.Linear(hidden, hidden // 2), _nn.ReLU(), _nn.Dropout(dropout),
+                        _nn.Linear(hidden // 2, n_classes),
+                    )
+                def forward(self, x): return self.net(x)
+
+            _ef_ckpt = _t.load(_ef_path, map_location="cpu")
+            _ef_dev  = (f"cuda:{args.gpu}" if args.gpu is not None and _t.cuda.is_available()
+                        else ("cuda" if _t.cuda.is_available() else "cpu"))
+            _ef_model = _EarlyFusionMLP(
+                _ef_ckpt["d_in"], _ef_ckpt["n_classes"],
+                _ef_ckpt.get("hidden", 256), _ef_ckpt.get("dropout", 0.3),
+            ).to(_ef_dev)
+            _ef_model.load_state_dict(_ef_ckpt["state_dict"])
+            _ef_model.eval()
+
+            _ef_emb_data   = _t.load(_ef_emb_path, map_location="cpu")
+            _ef_train_embs = _ef_emb_data["train"].numpy().astype(np.float32)  # (n_train, 768)
+            _ef_test_embs  = _ef_emb_data["test"].numpy().astype(np.float32)   # (n_test, 768)
+
+            # Build text_str → embedding lookup from both splits
+            _ef_text_to_emb: dict = {}
+            for _i, _t_str in enumerate(dataset.X_train_text):
+                _ef_text_to_emb[str(_t_str)] = _ef_train_embs[_i]
+            for _i, _t_str in enumerate(dataset.X_test_text):
+                _ef_text_to_emb.setdefault(str(_t_str), _ef_test_embs[_i])
+
+            # Training-sample prediction cache
+            _n_tr = len(dataset.X_train_static)
+            _ef_cache: dict = {}
+            _BS = 256
+            for _bs in range(0, _n_tr, _BS):
+                _be = min(_bs + _BS, _n_tr)
+                _inp = _t.tensor(np.concatenate([
+                    _ef_train_embs[_bs:_be],
+                    dataset.X_train_static[_bs:_be].astype(np.float32),
+                ], axis=1), dtype=_t.float32).to(_ef_dev)
+                with _t.no_grad():
+                    _preds = _ef_model(_inp).argmax(dim=-1).cpu().numpy()
+                for _i, _gi in enumerate(range(_bs, _be)):
+                    _ef_cache[(
+                        dataset.X_train_static[_gi].astype(np.float32).tobytes(),
+                        str(dataset.X_train_text[_gi]),
+                    )] = float(_preds[_i])
+            print(f"  [early fusion] Cached {len(_ef_cache):,} training-sample predictions.")
+
+            def _predict_fn(x_tab, x_ts, text_candidate,
+                            _model=_ef_model, _dev=_ef_dev,
+                            _cache=_ef_cache, _lookup=_ef_text_to_emb,
+                            _lock=_predict_fn_lock):
+                import torch as _t2
+                text = str(text_candidate) if text_candidate is not None else ""
+                if x_tab is not None:
+                    _hit = _cache.get((np.asarray(x_tab, dtype=np.float32).tobytes(), text))
+                    if _hit is not None:
+                        return _hit
+                emb = _lookup.get(text)
+                if emb is None:
+                    return 0.0  # unknown text; return majority class
+                tab = np.asarray(x_tab, dtype=np.float32)
+                inp = _t2.tensor(np.concatenate([emb, tab])[None, :], dtype=_t2.float32).to(_dev)
+                with _t2.no_grad():
+                    return float(_model(inp).argmax(dim=-1).cpu().item())
+
+            print(f"[early fusion] predict_fn ready using {_ef_path.name}")
+        except Exception as _e:
+            print(f"[warn] Early-fusion model failed to load: {_e}")
+    else:
+        print(f"[warn] Early-fusion files missing — predict_fn unavailable.")
+
+# ---- Late fusion predict_fn (tfidf+logreg text + gbt tabular, averaged) -----
+if _fusion_strategy == "late":
+    import pickle as _pickle
+    _lf_text_path = _DATA_DIR / "best_model_late_fusion_tfidf_logreg_text.pkl"
+    _lf_tab_path  = _DATA_DIR / "best_model_late_fusion_gbt_tabular.pkl"
+    if _lf_text_path.exists() and _lf_tab_path.exists():
+        try:
+            from sklearn.pipeline import Pipeline as _Pipeline
+            with open(_lf_text_path, "rb") as _f:
+                _lf_text_obj = _pickle.load(_f)
+            if isinstance(_lf_text_obj, dict) and "tfidf" in _lf_text_obj:
+                _lf_text_model = _Pipeline([("tfidf", _lf_text_obj["tfidf"]),
+                                            ("clf",   _lf_text_obj["model"])])
+            else:
+                _lf_text_model = _lf_text_obj if not isinstance(_lf_text_obj, dict) \
+                                 else _lf_text_obj["model"]
+            with open(_lf_tab_path, "rb") as _f:
+                _lf_tab_obj = _pickle.load(_f)
+            _lf_tab_model = _lf_tab_obj if not isinstance(_lf_tab_obj, dict) \
+                            else _lf_tab_obj["model"]
+
+            # Training-sample prediction cache
+            _n_tr = len(dataset.X_train_static)
+            _lf_cache: dict = {}
+            for _gi in range(_n_tr):
+                _txt   = str(dataset.X_train_text[_gi])
+                _tab   = dataset.X_train_static[_gi].astype(np.float32)
+                _p_txt = _lf_text_model.predict_proba([_txt])[0]
+                _p_tab = _lf_tab_model.predict_proba(_tab[None, :])[0]
+                _avg   = (_p_txt + _p_tab) / 2.0
+                _lf_cache[(dataset.X_train_static[_gi].astype(np.float32).tobytes(),
+                           _txt)] = float(np.argmax(_avg))
+            print(f"  [late fusion] Cached {len(_lf_cache):,} training-sample predictions.")
+
+            def _predict_fn(x_tab, x_ts, text_candidate,
+                            _cache=_lf_cache,
+                            _tmod=_lf_text_model, _tabmod=_lf_tab_model):
+                text = str(text_candidate) if text_candidate is not None else ""
+                if x_tab is not None:
+                    _hit = _cache.get((np.asarray(x_tab, dtype=np.float32).tobytes(), text))
+                    if _hit is not None:
+                        return _hit
+                p_txt = _tmod.predict_proba([text])[0]
+                p_tab = _tabmod.predict_proba(np.asarray(x_tab, dtype=np.float32)[None, :])[0]
+                return float(np.argmax((p_txt + p_tab) / 2.0))
+
+            print("[late fusion] predict_fn ready (tfidf_logreg_text + gbt_tabular averaged).")
+        except Exception as _e:
+            print(f"[warn] Late-fusion models failed to load: {_e}")
+    else:
+        print("[warn] Late-fusion model files missing — predict_fn unavailable.")
 
 # — Italian fastText (optional, "custom" encoder slot) —
 _italian_ft_embed_fn: Optional[object] = None
@@ -571,6 +741,7 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
     kwargs = {
         "text_objective_context": {"embed_fn": embed_fn},
         "y_target": joy_value,
+        "proximity_normalizer": _prox_norm,
         "plausibility_normalizer": {
             "tab_lof":  _tab_lof,
             "tab_low":  _tab_lof_low,
@@ -593,8 +764,6 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
 # Per-combo multimodal generator factory
 # Adds FrankensteinNN, CombinedNN, and EarlyFusionNN to each combo.
 # ---------------------------------------------------------------------------
-_k_search = min(50, args.k * 5)
-
 def _multimodal_generators_factory(
     tab_cfg,
     ts_cfg,
@@ -614,13 +783,13 @@ def _multimodal_generators_factory(
     extras = {
         "Frankenstein": FrankensteinNN(
             k=args.k,
-            k_search=_k_search,
+            k_search=args.k_search_combined,
             static_dist_fn=static_dist,
             e5_embed_fn=embed_fn,
         ),
         "Combined": CombinedNN(
             k=args.k,
-            k_search=_k_search,
+            k_search=args.k_search_combined,
             static_dist_fn=static_dist,
             e5_embed_fn=embed_fn,
         ),
@@ -652,7 +821,15 @@ def _multimodal_generators_factory(
 # ---------------------------------------------------------------------------
 # Run ablation
 # ---------------------------------------------------------------------------
+_default_run_names = {
+    "intermediate": "fusion_intermediate_deep_k50",
+    "early":        "fusion_early_mlp_k50",
+    "late":         "fusion_late_nondp_k50",
+}
+_run_name = args.run_name or _default_run_names[_fusion_strategy]
+
 print(f"\nRunning distance ablation …")
+print(f"  Fusion strategy : {_fusion_strategy}  →  {_run_name}")
 print(f"  Samples : {len(sadness_indices)} (predicted '{label_classes[source_value]}')")
 print(f"  Target  : {joy_value} ({label_classes[joy_value]})")
 print(f"  k       : {args.k}")
@@ -661,23 +838,35 @@ print(f"  Tab metrics   : {tab_metrics}")
 print(f"  Text encoders : {text_encoders}")
 print()
 
-run_distance_ablation(
-    dataset                   = dataset,
-    model                     = None,
-    sample_indices            = sadness_indices,
-    target_value              = joy_value,
-    k                         = args.k,
-    tab_metrics               = tab_metrics,
-    ts_metrics                = [],
-    text_encoders             = text_encoders,
-    text_vector_metrics       = text_vector_metrics,
-    text_direct_metrics       = text_direct_metrics,
-    text_backend_kwargs       = text_bk,
-    output_dir                = args.output_dir,
-    run_name                  = args.run_name,
-    save_full                 = args.save_full,
-    max_combinations          = args.max_combinations,
-    n_jobs                    = args.n_jobs,
-    objectives_kwargs_factory = _objectives_kwargs_factory,
-    extra_generators_factory  = _multimodal_generators_factory,
-)
+if args.eval_pkls:
+    from evaluate_k_ablation import evaluate_k_ablation
+    _eval_dirs = [Path(d.strip()) for d in args.eval_pkls.split(",")]
+    _k_vals = [int(x) for x in args.k_values.split(",")]
+    evaluate_k_ablation(
+        run_dirs=_eval_dirs,
+        dataset=dataset,
+        objectives_kwargs_factory=_objectives_kwargs_factory,
+        k_values=_k_vals,
+        output_path=_eval_dirs[0] / f"k_ablation_summary_k{'_'.join(str(k) for k in _k_vals)}.json",
+    )
+else:
+    run_distance_ablation(
+        dataset                   = dataset,
+        model                     = None,
+        sample_indices            = sadness_indices,
+        target_value              = joy_value,
+        k                         = args.k,
+        tab_metrics               = tab_metrics,
+        ts_metrics                = [],
+        text_encoders             = text_encoders,
+        text_vector_metrics       = text_vector_metrics,
+        text_direct_metrics       = text_direct_metrics,
+        text_backend_kwargs       = text_bk,
+        output_dir                = args.output_dir,
+        run_name                  = _run_name,
+        save_full                 = args.save_full,
+        max_combinations          = args.max_combinations,
+        n_jobs                    = args.n_jobs,
+        objectives_kwargs_factory = _objectives_kwargs_factory,
+        extra_generators_factory  = _multimodal_generators_factory,
+    )

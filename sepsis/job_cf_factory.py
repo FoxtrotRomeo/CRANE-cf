@@ -36,6 +36,7 @@ def build_sepsis_dataset(
     data_dir: Optional[str] = None,
     gpu: Optional[int] = None,
     load_model: bool = True,
+    fusion_strategy: str = "early",
 ) -> Dict[str, Any]:
     """Load one sepsis fold as a MultimodalDataset plus its trained model."""
     root = Path(data_dir) if data_dir is not None else DATA_DIR
@@ -59,8 +60,13 @@ def build_sepsis_dataset(
         y_test=y_test,
     )
 
-    y_pred_path = fold_dir / "y_pred.npy"
-    y_proba_path = fold_dir / "y_proba.npy"
+    _pred_suffix = {
+        "early":        ("y_pred.npy",                "y_proba.npy"),
+        "intermediate": ("y_pred_intermediate_rf.npy", "y_proba_intermediate_rf.npy"),
+        "late":         ("y_pred_late_deep.npy",       "y_proba_late_deep.npy"),
+    }.get(fusion_strategy, ("y_pred.npy", "y_proba.npy"))
+    y_pred_path = fold_dir / _pred_suffix[0]
+    y_proba_path = fold_dir / _pred_suffix[1]
     y_pred = np.load(y_pred_path) if y_pred_path.exists() else None
     y_proba = np.load(y_proba_path) if y_proba_path.exists() else None
 

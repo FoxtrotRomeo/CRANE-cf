@@ -301,7 +301,8 @@ def _build_image_configs(
 
 def _text_branch_names_for_ablation(dataset, text_backend_kwargs: Dict[str, Any]) -> List[str]:
     auto_text_branches = bool(text_backend_kwargs.get("auto_text_branch_generators", True))
-    if auto_text_branches:
+    precompute_all = bool(text_backend_kwargs.get("precompute_all_text_branches", False))
+    if auto_text_branches or precompute_all:
         return list(dataset.text_names())
     return [dataset.primary_text_name] if dataset.primary_text_name is not None else []
 
@@ -1249,12 +1250,29 @@ def run_distance_ablation(
 
     run_root = None
     jsonl_path = None
+    _completed_combo_ids: set = set()
     if output_dir is not None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_label = run_name or f"distance_ablation_{stamp}"
         run_root = Path(output_dir) / run_label
         run_root.mkdir(parents=True, exist_ok=True)
         jsonl_path = run_root / "summary.jsonl"
+        if jsonl_path.exists():
+            with open(jsonl_path, encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _entry = json.loads(_line)
+                        _cid = str(_entry.get("combo_id", ""))
+                        if _cid and _entry.get("status") == "ok":
+                            _completed_combo_ids.add(_cid)
+                            rows.append(_entry)
+                    except json.JSONDecodeError:
+                        pass
+            if _completed_combo_ids:
+                print(f"[ablation] Resuming: {len(_completed_combo_ids)} combo(s) already done, skipping.")
 
     def _persist_combo_output(row: Dict[str, Any], results: Dict[int, Dict[str, Any]]) -> None:
         rows.append(row)
@@ -1318,9 +1336,22 @@ def run_distance_ablation(
         )
 
     combo_enumerator = enumerate(combo_args_list, start=1)
+
+    def _next_pending(enumerator):
+        """Advance enumerator past already-completed combos; raises StopIteration when exhausted."""
+        while True:
+            idx, args = next(enumerator)
+            cid = f"combo_{idx:05d}"
+            if cid not in _completed_combo_ids:
+                return idx, args
+            print(f"[ablation] Skipping {cid} (already done).")
+
     if n_jobs == 1:
         for combo_idx, combo_args in combo_enumerator:
             combo_id = f"combo_{combo_idx:05d}"
+            if combo_id in _completed_combo_ids:
+                print(f"[ablation] Skipping {combo_id} (already done).")
+                continue
             print(f"[ablation] Running {combo_id} ...")
             tab_cfg, ts_cfg, text_cfg, image_cfg = combo_args
             row, results = _run_ablation_combo(
@@ -1361,7 +1392,7 @@ def run_distance_ablation(
 
             for _ in range(n_jobs):
                 try:
-                    combo_idx, combo_args = next(combo_enumerator)
+                    combo_idx, combo_args = _next_pending(combo_enumerator)
                 except StopIteration:
                     break
                 future = _submit_combo(executor, combo_idx, combo_args)
@@ -1382,7 +1413,7 @@ def run_distance_ablation(
                     _persist_combo_output(row, results)
 
                     try:
-                        combo_idx, combo_args = next(combo_enumerator)
+                        combo_idx, combo_args = _next_pending(combo_enumerator)
                     except StopIteration:
                         continue
                     new_future = _submit_combo(executor, combo_idx, combo_args)
