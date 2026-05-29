@@ -1,18 +1,26 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
-title: "cf-lib: Nearest-Neighbour Multimodal Counterfactual Generation Library"
+title: "CRANE: Post-Hoc Counterfactual Retrieval for Multimodal Classifiers"
 abstract: >
   cf-lib is a Python library for generating nearest-neighbour counterfactual
   explanations for multimodal classifiers. It supports tabular, time-series,
   and text modalities, and provides unimodal generators (TabularNN,
-  TimeSeriesNN, TextNN) as well as multimodal strategies (EarlyFusionNN,
-  IntermediateFusionNN, FrankensteinNN, CombinedNN).
+  TimeSeriesNN, TextNN) as well as multimodal strategies (EF-NN,
+  IF-NN, MPS, MC-R).
 authors:
   - family-names: "Rugolon"
     given-names: "Franco"
     affiliation: "Stockholm University, Department of Computer and Systems Sciences"
     orcid: "https://orcid.org/0000-0002-7693-0576"
+- family-names: "Miliou"
+    given-names: "Ioanna"
+    affiliation: "Stockholm University, Department of Computer and Systems Sciences"
+    orcid: "https://orcid.org/0000-0002-1357-1967"
+- family-names: "Papapetrou"
+    given-names: "Panagiotis"
+    affiliation: "Stockholm University, Department of Computer and Systems Sciences"
+    orcid: "https://orcid.org/0000-0002-4632-4815"
 date-released: "2026-03-10"
 version: "0.1.0"
 license: Apache-2.0
