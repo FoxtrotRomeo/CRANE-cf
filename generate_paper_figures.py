@@ -436,18 +436,17 @@ def plot_fig1_global_boxplot(datasets: List[str], strategies: List[str], outdir:
         return
     cmap = _build_color_map(crane_gens)
 
-    fig, axes = plt.subplots(1, 4, figsize=(8, 2), sharey=True)
+    fig, axes_grid = plt.subplots(2, 2, figsize=(6, 4.3))
+    axes = axes_grid.flatten()
 
     for ax, metric in zip(axes, METRICS):
         box_data  = []
         positions = []
-        labels    = []
         for pos, gen in enumerate(crane_gens):
             vals = all_crane[all_crane["generator"] == gen][metric].dropna().values
             if len(vals):
                 box_data.append((pos, vals, cmap[gen]))
                 positions.append(pos)
-                labels.append(_glabel(gen))
 
         if box_data:
             bplot = ax.boxplot(
@@ -464,12 +463,17 @@ def plot_fig1_global_boxplot(datasets: List[str], strategies: List[str], outdir:
                 patch.set_facecolor(col)
                 patch.set_alpha(0.7)
 
-        ax.set_title(METRIC_LABELS[metric], fontsize=10)
+        ax.set_title(METRIC_LABELS[metric], fontsize=11)
         ax.set_xticks(positions)
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=6)
+        ax.set_xticklabels([""] * len(positions))
         ax.grid(axis="y", alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0, 1, 1])
+    handles = [mpatches.Patch(facecolor=cmap[gen], alpha=0.7, edgecolor="black",
+                               linewidth=0.4, label=_glabel(gen))
+               for gen in crane_gens]
+    fig.legend(handles=handles, fontsize=11, loc="center left",
+               bbox_to_anchor=(1.01, 0.5), ncol=1, frameon=True)
+    plt.tight_layout()
     path = outdir / "global_boxplot.pdf"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -1154,7 +1158,9 @@ _UNIMODAL_GENERATORS = {"Tabular", "TS[lab_exams_vitals]", "Text", "Image"}
 
 
 def _plot_k_lines(k_data: Dict[int, Dict[str, Dict[str, float]]],
-                  title: str, path: Path) -> None:
+                  title: str, path: Path,
+                  figsize: Tuple[float, float] = (8, 2),
+                  legend_fontsize: int = 6) -> None:
     """Shared renderer: k on x-axis (log scale), one line per generator, 4 metric subplots.
     Unimodal generators: dashed lines. Multimodal generators: solid lines.
     """
@@ -1168,7 +1174,7 @@ def _plot_k_lines(k_data: Dict[int, Dict[str, Dict[str, float]]],
         return
 
     cmap = _build_color_map(all_gens)
-    fig, axes = plt.subplots(1, 4, figsize=(8, 2), sharey=True)
+    fig, axes = plt.subplots(1, 4, figsize=figsize, sharey=True)
 
     for ax, metric in zip(axes, METRICS):
         for gen in all_gens:
@@ -1197,9 +1203,9 @@ def _plot_k_lines(k_data: Dict[int, Dict[str, Dict[str, float]]],
         for g in multi:
             handles.append(mlines.Line2D([], [], color=cmap[g], linewidth=1.4,
                                          linestyle="-", marker="o", markersize=4, label=_glabel(g)))
-    fig.legend(handles=handles, fontsize=6, loc="lower center",
-               bbox_to_anchor=(0.5, 0), ncol=5, frameon=True)
-    plt.tight_layout(rect=[0, 0.25, 1, 1])
+    fig.legend(handles=handles, fontsize=legend_fontsize, loc="lower center",
+               bbox_to_anchor=(0.5, 0), ncol=8, frameon=True)
+    plt.tight_layout(rect=[0, 0.10, 1, 1])
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {path.name}")
@@ -1246,7 +1252,63 @@ def plot_figK_global(datasets: List[str], strategies: List[str], outdir: Path) -
               for k, gens in acc.items()}
     title = "All datasets & strategies — effect of k"
     path  = outdir / "k_ablation_global.pdf"
-    _plot_k_lines(k_data, title, path)
+    _plot_k_lines(k_data, title, path, figsize=(6, 1.5), legend_fontsize=8)
+
+
+def plot_figK_global_2x2(datasets: List[str], strategies: List[str], outdir: Path) -> None:
+    """2×2 line plot averaged across all datasets and fusion strategies."""
+    acc: Dict[int, Dict[str, Dict[str, list]]] = {}
+    for ds in datasets:
+        for strat in strategies:
+            for k, gens in load_k_ablation(ds, strat).items():
+                for gen, metrics in gens.items():
+                    for m, v in metrics.items():
+                        acc.setdefault(k, {}).setdefault(gen, {}).setdefault(m, []).append(v)
+    if not acc:
+        return
+    k_data = {k: {gen: {m: float(np.nanmean(vs)) for m, vs in metrics.items()}
+                  for gen, metrics in gens.items()}
+              for k, gens in acc.items()}
+
+    k_vals  = sorted(k_data.keys())
+    all_gens = [g for g in CRANE_GENERATORS if any(g in k_data[k] for k in k_vals)]
+    if not all_gens:
+        return
+
+    cmap = _build_color_map(all_gens)
+    fig, axes_grid = plt.subplots(2, 2, figsize=(5, 3.4))
+    axes = axes_grid.flatten()
+
+    for ax, metric in zip(axes, METRICS):
+        for gen in all_gens:
+            ys = [k_data[k].get(gen, {}).get(metric, np.nan) for k in k_vals]
+            if all(np.isnan(y) for y in ys):
+                continue
+            ls = "--" if gen in _UNIMODAL_GENERATORS else "-"
+            ax.plot(k_vals, ys, marker="o", markersize=4, linewidth=1.4,
+                    linestyle=ls, color=cmap[gen], label=_glabel(gen))
+        ax.set_xscale("log")
+        ax.set_xticks(k_vals)
+        ax.set_xticklabels([str(k) for k in k_vals], fontsize=7)
+        ax.set_xlabel("k", fontsize=8)
+        ax.set_title(METRIC_LABELS[metric], fontsize=10)
+        ax.grid(alpha=0.3)
+
+    import matplotlib.lines as mlines
+    handles = []
+    for g in [g for g in all_gens if g in _UNIMODAL_GENERATORS]:
+        handles.append(mlines.Line2D([], [], color=cmap[g], linewidth=1.4,
+                                     linestyle="--", marker="o", markersize=4, label=_glabel(g)))
+    for g in [g for g in all_gens if g not in _UNIMODAL_GENERATORS]:
+        handles.append(mlines.Line2D([], [], color=cmap[g], linewidth=1.4,
+                                     linestyle="-", marker="o", markersize=4, label=_glabel(g)))
+    fig.legend(handles=handles, fontsize=8, loc="center left",
+               bbox_to_anchor=(1.01, 0.5), ncol=1, frameon=True)
+    plt.tight_layout()
+    path = outdir / "k_ablation_global_2x2.pdf"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -1333,6 +1395,7 @@ def main() -> None:
             plot_figK_dataset(ds, args.strategies, out / "figK")
         print("  --- global (all datasets & strategies) ---")
         plot_figK_global(args.datasets, args.strategies, out / "figK")
+        plot_figK_global_2x2(args.datasets, args.strategies, out / "figK")
 
     print(f"\nAll outputs in: {out.resolve()}")
 
