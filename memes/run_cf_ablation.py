@@ -10,8 +10,8 @@ Generators
 ----------
 - TextNN on meme text
 - ImageNN on meme image
-- FrankensteinNN (independent text/image anchors)
-- CombinedNN (intersection of text/image neighbor sets)
+- ModalityWisePrototypeSynthesis (independent text/image anchors)
+- MultimodalConsensusRetrieval (intersection of text/image neighbor sets)
 - EarlyFusionNN (concatenated text+image embedding space)
 - IntermediateFusionNN (best-model latent space from the trained classifier)
 
@@ -45,7 +45,7 @@ for _p in [str(_ROOT), str(_ROOT / "examples")]:
 
 from hateful_memes_cf_factory import build_hateful_memes_dataset
 from run_distance_ablation import run_distance_ablation
-from cf_lib.multimodal import CombinedNN, EarlyFusionNN, FrankensteinNN, IntermediateFusionNN
+from cf_lib.multimodal import MultimodalConsensusRetrieval, EarlyFusionNN, ModalityWisePrototypeSynthesis, IntermediateFusionNN
 from cf_lib.counterfactual_evaluation_helpers import (
     _make_embed_fn_from_e5_kwargs,
     fit_image_lof,
@@ -81,7 +81,7 @@ parser.add_argument("--n-jobs", type=int, default=1,
 parser.add_argument("--output-dir", type=str, default="data/ablation_runs")
 parser.add_argument("--run-name", type=str, default=None)
 parser.add_argument("--k-search-combined", type=int, default=300,
-                    help="k_search pool size for FrankensteinNN and CombinedNN (default: 300).")
+                    help="k_search pool size for ModalityWisePrototypeSynthesis and MultimodalConsensusRetrieval (default: 300).")
 parser.add_argument("--fusion-strategy", type=str, default="intermediate",
                     choices=["intermediate", "early", "late"],
                     help="Which fusion model to use for predict_fn / latents. "
@@ -792,7 +792,7 @@ def _multimodal_generators_factory(
     image_pre = _image_precomputed_for_encoder(image_encoder)
 
     return {
-        "Frankenstein": FrankensteinNN(
+        "MPS": ModalityWisePrototypeSynthesis(
             k=args.k,
             k_search=args.k_search_combined,
             e5_embed_fn=text_embed_fn,
@@ -801,7 +801,7 @@ def _multimodal_generators_factory(
             img_device=DEVICE,
             img_batch_size=args.image_batch_size,
         ),
-        "Combined": CombinedNN(
+        "MC-R": MultimodalConsensusRetrieval(
             k=args.k,
             k_search=args.k_search_combined,
             e5_embed_fn=text_embed_fn,

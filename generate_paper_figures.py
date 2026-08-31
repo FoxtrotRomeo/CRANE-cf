@@ -120,8 +120,13 @@ REGISTRY_FILES = {
 
 CRANE_GENERATORS = [
     "Tabular", "TS[lab_exams_vitals]", "Text", "Image",
-    "EarlyFusion", "IntermediateFusion", "Frankenstein", "Combined",
+    "EarlyFusion", "IntermediateFusion", "MPS", "MC-R",
 ]
+
+# summary.json files saved before the MPS/MC-R rename used the old generator
+# names ("Frankenstein"/"Combined") as dict keys — load_crane() normalizes
+# them to the current keys so pre-existing ablation runs still plot.
+LEGACY_GEN_KEY_ALIASES = {"Frankenstein": "MPS", "Combined": "MC-R"}
 
 _PALETTE = [
     "#4e79a7","#f28e2b","#59a14f","#e15759",
@@ -131,8 +136,8 @@ _PALETTE = [
 ]
 
 _FIXED_COLORS = {
-    "Combined": "#000000",  # black highlight
-    "Image":    "#f4a7b9",  # light pink
+    "MC-R":  "#000000",  # black highlight
+    "Image": "#f4a7b9",  # light pink
 }
 
 GENERATOR_DISPLAY: Dict[str, str] = {
@@ -140,8 +145,8 @@ GENERATOR_DISPLAY: Dict[str, str] = {
     "TS[lab_exams_vitals]": "TimeSeriesNN",
     "Text":                 "TextNN",
     "Image":                "ImageNN",
-    "Frankenstein":         "MPS",
-    "Combined":             "MC-R",
+    "MPS":                  "MPS",
+    "MC-R":                 "MC-R",
     "EarlyFusion":          "EF-NN",
     "IntermediateFusion":   "IF-NN",
 }
@@ -206,8 +211,12 @@ def load_crane(dataset: str, strategy: str) -> pd.DataFrame:
         tab_m = list(tab.values())[0] if tab else None
         ts_m  = list(list(ts.values())[0].values())[0] if ts else None
         records = []
-        for gen, obj in row.get("objectives", {}).items():
-            cov = row.get("candidate_counts", {}).get(gen, 0) / n_s
+        counts = row.get("candidate_counts", {})
+        for raw_gen, obj in row.get("objectives", {}).items():
+            # Normalize pre-rename generator names ("Frankenstein"/"Combined")
+            # from older summary.json files to the current MPS/MC-R keys.
+            gen = LEGACY_GEN_KEY_ALIASES.get(raw_gen, raw_gen)
+            cov = counts.get(raw_gen, 0) / n_s
             records.append({
                 "generator":    gen,
                 "combo_id":     row.get("combo_id", ""),
@@ -866,7 +875,7 @@ def generate_runtime_table(outdir: Path) -> None:
     for g in CRANE_GENERATORS:
         if g in crane_rt:
             val = float(np.mean(crane_rt[g]))
-            highlight = r"\textbf{" + g + "}" if g == "Combined" else g.replace("_", r"\_")
+            highlight = r"\textbf{" + g + "}" if g == "MC-R" else g.replace("_", r"\_")
             rows_tex.append(f"  {highlight} & {val:.3f} \\\\")
 
     tex = r"""\begin{table}[ht]
@@ -1129,7 +1138,8 @@ def load_k_ablation(dataset: str, strategy: str) -> Dict[int, Dict[str, Dict[str
             return
         for k_str, entry in data.get("results", {}).items():
             k = int(k_str)
-            for gen, obj in entry.get("objectives", {}).items():
+            for raw_gen, obj in entry.get("objectives", {}).items():
+                gen = LEGACY_GEN_KEY_ALIASES.get(raw_gen, raw_gen)
                 for m in METRICS:
                     v = obj.get(m)
                     if v is not None and v == v:  # skip nan

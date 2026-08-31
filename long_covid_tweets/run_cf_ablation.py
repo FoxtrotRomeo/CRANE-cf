@@ -53,7 +53,7 @@ from sklearn.metrics.pairwise import euclidean_distances, manhattan_distances
 from tweet_cf_factory import build_tweet_dataset
 from run_distance_ablation import run_distance_ablation  # from examples/
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.multimodal import FrankensteinNN, CombinedNN, EarlyFusionNN
+from cf_lib.multimodal import ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval, EarlyFusionNN
 from cf_lib.unimodal import TabularNN
 from cf_lib.counterfactual_helpers import find_k_closest_latent
 from cf_lib.counterfactual_evaluation_helpers import fit_proximity_normalizer
@@ -76,7 +76,7 @@ parser.add_argument("--n-jobs",          type=int,   default=1,
 parser.add_argument("--output-dir",      type=str,   default="data/ablation_runs")
 parser.add_argument("--run-name",        type=str,   default=None)
 parser.add_argument("--k-search-combined", type=int, default=300,
-                    help="k_search pool size for FrankensteinNN and CombinedNN (default: 300).")
+                    help="k_search pool size for ModalityWisePrototypeSynthesis and MultimodalConsensusRetrieval (default: 300).")
 parser.add_argument("--fusion-strategy", type=str,   default="intermediate",
                     choices=["intermediate", "early", "late"],
                     help="Which fusion model to use for predict_fn / latents. "
@@ -371,7 +371,7 @@ if _fusion_strategy == "intermediate" and _pt_path.exists():
         # Precompute model predictions for all training samples in one batched pass.
         # Unimodal / Combined / EarlyFusion / IntermediateFusion candidates are pure
         # training samples, so their predictions are exact cache hits.  Only
-        # FrankensteinNN assembles hybrids (tabular from one training sample, text
+        # ModalityWisePrototypeSynthesis assembles hybrids (tabular from one training sample, text
         # from another), so those candidates will miss and fall through to serialized
         # live inference.
         print("Precomputing model predictions for all training samples …")
@@ -762,7 +762,7 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
 
 # ---------------------------------------------------------------------------
 # Per-combo multimodal generator factory
-# Adds FrankensteinNN, CombinedNN, and EarlyFusionNN to each combo.
+# Adds ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval, and EarlyFusionNN to each combo.
 # ---------------------------------------------------------------------------
 def _multimodal_generators_factory(
     tab_cfg,
@@ -781,13 +781,13 @@ def _multimodal_generators_factory(
     static_dist   = _metric_to_static_dist_fn(tab_metric)
 
     extras = {
-        "Frankenstein": FrankensteinNN(
+        "MPS": ModalityWisePrototypeSynthesis(
             k=args.k,
             k_search=args.k_search_combined,
             static_dist_fn=static_dist,
             e5_embed_fn=embed_fn,
         ),
-        "Combined": CombinedNN(
+        "MC-R": MultimodalConsensusRetrieval(
             k=args.k,
             k_search=args.k_search_combined,
             static_dist_fn=static_dist,

@@ -1,4 +1,4 @@
-"""Frankenstein nearest-neighbour counterfactual generator."""
+"""Modality-wise Prototype Synthesis (MPS): independent per-modality nearest-neighbour counterfactual generator."""
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
@@ -16,7 +16,7 @@ from cf_lib.counterfactual_helpers import (
 from cf_lib.base import CounterfactualGenerator
 
 
-class FrankensteinNN(CounterfactualGenerator):
+class ModalityWisePrototypeSynthesis(CounterfactualGenerator):
     """Hybrid counterfactuals from independent per-modality neighbor searches.
 
     For each test sample, runs separate NN searches for each present modality
@@ -377,7 +377,7 @@ class FrankensteinNN(CounterfactualGenerator):
         }
 
         if not active_numeric and not active_texts and not active_images:
-            print("[FrankensteinNN] no modalities available for this dataset — returning empty candidates.")
+            print("[ModalityWisePrototypeSynthesis] no modalities available for this dataset — returning empty candidates.")
             return []
 
         return self._frankenstein_partial(
@@ -390,3 +390,7 @@ class FrankensteinNN(CounterfactualGenerator):
             primary_text_name=dataset.primary_text_name,
             primary_image_name=dataset.primary_image_name,
         )
+
+
+# Short alias matching the paper's abbreviation (MPS).
+MPS = ModalityWisePrototypeSynthesis

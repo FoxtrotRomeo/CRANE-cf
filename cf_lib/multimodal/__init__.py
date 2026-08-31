@@ -1,6 +1,13 @@
 from .ef_nn import EarlyFusionNN
 from .intermediate_fusion import IntermediateFusionNN
-from .frankenstein import FrankensteinNN
-from .combined_nn import CombinedNN
+from .frankenstein import ModalityWisePrototypeSynthesis, MPS
+from .combined_nn import MultimodalConsensusRetrieval, MCR
 
-__all__ = ["EarlyFusionNN", "IntermediateFusionNN", "FrankensteinNN", "CombinedNN"]
+__all__ = [
+    "EarlyFusionNN",
+    "IntermediateFusionNN",
+    "ModalityWisePrototypeSynthesis",
+    "MPS",
+    "MultimodalConsensusRetrieval",
+    "MCR",
+]

@@ -47,7 +47,7 @@ from sklearn.metrics.pairwise import euclidean_distances, manhattan_distances
 from job_cf_factory import build_job_dataset
 from run_distance_ablation import run_distance_ablation
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.multimodal import CombinedNN, EarlyFusionNN
+from cf_lib.multimodal import MultimodalConsensusRetrieval, EarlyFusionNN
 from cf_lib.unimodal import TabularNN, TextNN
 from cf_lib.counterfactual_helpers import find_k_closest_latent, find_k_closest_static
 from sklearn.metrics import pairwise_distances as _pairwise_dist
@@ -338,7 +338,7 @@ def _get_cls(field: str, text: str) -> np.ndarray:
     lk = _cls_lookup.get(field, {})
     v  = lk.get(text)
     if v is None:
-        # Live inference fallback (slow; only for Frankenstein hybrids)
+        # Live inference fallback (slow; only for MPS hybrids)
         if _bert_embed_fn is not None:
             v = np.asarray(_bert_embed_fn([text]), dtype=np.float32)[0]
         else:
@@ -756,13 +756,13 @@ def _make_generators_factory(k, k_search, include_intermediate_fusion,
             extras[f"Text_{fname}"] = _FieldTextNN(fname, inner, X_train_description)
 
         if pre_desc and pre_profile and pre_reqs:
-            from run_cf_ablation import MultiFieldFrankensteinNN, MultiFieldCombinedNN
-            extras["Frankenstein"] = MultiFieldFrankensteinNN(
+            from run_cf_ablation import MultiFieldModalityWisePrototypeSynthesis, MultiFieldMultimodalConsensusRetrieval
+            extras["MPS"] = MultiFieldModalityWisePrototypeSynthesis(
                 pre_desc=pre_desc, pre_profile=pre_profile, pre_reqs=pre_reqs,
                 y_train=dataset.y_train, vec_metric=vec_metric,
                 k=k, k_search=k_search, static_dist_fn=static_dist,
             )
-            extras["Combined"] = MultiFieldCombinedNN(
+            extras["MC-R"] = MultiFieldMultimodalConsensusRetrieval(
                 pre_desc=pre_desc, pre_profile=pre_profile, pre_reqs=pre_reqs,
                 y_train=dataset.y_train, vec_metric=vec_metric,
                 k=k, k_search=k_search, static_dist_fn=static_dist,

@@ -26,7 +26,7 @@ from sklearn.metrics.pairwise import euclidean_distances, manhattan_distances
 from job_cf_factory import LABEL_CLASSES, TS_NAME, build_sepsis_dataset
 from run_distance_ablation import run_distance_ablation
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.multimodal import CombinedNN, EarlyFusionNN, FrankensteinNN
+from cf_lib.multimodal import MultimodalConsensusRetrieval, EarlyFusionNN, ModalityWisePrototypeSynthesis
 from cf_lib.unimodal import TabularNN
 from cf_lib.counterfactual_evaluation_helpers import compute_tau_c, fit_plausibility_normalizer, fit_proximity_normalizer
 from cf_lib.counterfactual_helpers import find_k_closest_latent
@@ -240,7 +240,7 @@ parser.add_argument(
     "--k-search-combined",
     type=int,
     default=300,
-    help="k_search pool size for FrankensteinNN and CombinedNN (default: 300).",
+    help="k_search pool size for ModalityWisePrototypeSynthesis and MultimodalConsensusRetrieval (default: 300).",
 )
 parser.add_argument(
     "--max-samples",
@@ -577,12 +577,12 @@ for fold in folds:
         static_dist = _metric_to_static_dist_fn(tab_metric)
 
         extras = {
-            "Frankenstein": FrankensteinNN(
+            "MPS": ModalityWisePrototypeSynthesis(
                 k=args.k_per_fold,
                 k_search=args.k_search_combined,
                 static_dist_fn=static_dist,
             ),
-            "Combined": CombinedNN(
+            "MC-R": MultimodalConsensusRetrieval(
                 k=args.k_per_fold,
                 k_search=args.k_search_combined,
                 static_dist_fn=static_dist,
