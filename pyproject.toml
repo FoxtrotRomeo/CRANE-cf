@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cf-lib"
+name = "crane-cf"
 version = "0.1.0"
 description = "Nearest-neighbour multimodal counterfactual generation library"
 readme = "README.md"
@@ -34,7 +34,7 @@ model = [
 ]
 # Everything
 all = [
-    "cf-lib[text,model]",
+    "crane-cf[text,model]",
 ]
 # Development
 dev = [
