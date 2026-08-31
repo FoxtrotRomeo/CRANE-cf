@@ -8,8 +8,15 @@
 
 `CRANE` generates counterfactual explanations for multimodal classifiers by searching for the closest opposite-class training samples in configurable distance spaces. It supports tabular, time-series, text, and image modalities, including multiple named branches of the same modality type, and provides several combination strategies.
 
-> If you use this library in your research, please cite the associated paper
-> (see [CITATION.cff](CITATION.cff)).
+## Authors
+
+- **Franco Rugolon** — [ORCID 0000-0002-7693-0576](https://orcid.org/0000-0002-7693-0576)
+- **Ioanna Miliou** — [ORCID 0000-0002-1357-1967](https://orcid.org/0000-0002-1357-1967)
+- **Panagiotis Papapetrou** — [ORCID 0000-0002-4632-4815](https://orcid.org/0000-0002-4632-4815)
+
+Department of Computer and Systems Sciences, Stockholm University, Sweden.
+
+CRANE is described in *CRANE: Post-Hoc Counterfactual Retrieval for Multimodal Classifiers*. If you use this library in your research, please cite the paper (see [CITATION.cff](CITATION.cff)).
 
 ---
 
