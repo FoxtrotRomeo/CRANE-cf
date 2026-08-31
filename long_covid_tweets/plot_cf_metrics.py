@@ -48,8 +48,13 @@ METRIC_LABELS = {
 }
 
 NN_GENERATORS = [
-    "Tabular", "Text", "Frankenstein", "Combined", "EarlyFusion", "IntermediateFusion",
+    "Tabular", "Text", "MPS", "MC-R", "EarlyFusion", "IntermediateFusion",
 ]
+
+# summary.json files saved before the MPS/MC-R rename used the old generator
+# names ("Frankenstein"/"Combined") as dict keys — fall back to those so
+# pre-existing ablation runs still plot.
+LEGACY_GEN_KEY_ALIASES = {"MPS": "Frankenstein", "MC-R": "Combined"}
 
 # (display_name, subfolder_name)
 GENETIC_VARIANTS = [
@@ -71,8 +76,8 @@ ALL_GENERATORS     = NN_GENERATORS + GENETIC_GENERATORS
 GEN_SHORT = {
     "Tabular":               "Tab",
     "Text":                  "Text",
-    "Frankenstein":          "Frank",
-    "Combined":              "Comb",
+    "MPS":                   "MPS",
+    "MC-R":                  "MC-R",
     "EarlyFusion":           "EFus",
     "IntermediateFusion":    "IntFus",
     "Genetic":               "Gen",
@@ -117,7 +122,7 @@ def load_nn_data() -> pd.DataFrame:
             continue
         objectives = row.get("objectives", {})
         for gen in NN_GENERATORS:
-            obj = objectives.get(gen)
+            obj = objectives.get(gen) or objectives.get(LEGACY_GEN_KEY_ALIASES.get(gen))
             if not obj:
                 continue
             rec = {"generator": gen, "combo_id": row.get("combo_id")}
@@ -146,10 +151,11 @@ def load_nn_flip_rate() -> pd.DataFrame:
             continue
         counts = row.get("candidate_counts", {})
         for gen in NN_GENERATORS:
+            count = counts.get(gen, counts.get(LEGACY_GEN_KEY_ALIASES.get(gen), 0))
             records.append({
                 "generator": gen,
                 "combo_id":  row.get("combo_id"),
-                "flip_rate": 1.0 if counts.get(gen, 0) > 0 else 0.0,
+                "flip_rate": 1.0 if count > 0 else 0.0,
             })
     return pd.DataFrame(records)
 

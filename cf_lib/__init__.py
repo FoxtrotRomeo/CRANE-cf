@@ -6,7 +6,7 @@ Quickstart
 
     from cf_lib import MultimodalDataset, CounterfactualLibrary
     from cf_lib.unimodal import TabularNN, TimeSeriesNN, TextNN
-    from cf_lib.multimodal import FrankensteinNN, CombinedNN
+    from cf_lib.multimodal import ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval
 
     dataset = MultimodalDataset(
         X_train_static=...,
@@ -32,8 +32,8 @@ Quickstart
             "Tab1":          TabularNN(tab_name="tab1"),
             "Time Series 1": TimeSeriesNN("ts1"),
             "Time Series 2": TimeSeriesNN("ts2"),
-            "Frankenstein":  FrankensteinNN(),
-            "Combined":      CombinedNN(),
+            "MPS":           ModalityWisePrototypeSynthesis(),
+            "MC-R":          MultimodalConsensusRetrieval(),
         }
     )
     results = lib.generate(dataset, sample_idx=3, model=trained_model, target_value=0)
@@ -46,7 +46,14 @@ from typing import Any, Dict, List, Optional
 from cf_lib.dataset import MultimodalDataset
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.unimodal import TabularNN, TimeSeriesNN, LabsNN, MedsNN, TextNN, ImageNN
-from cf_lib.multimodal import EarlyFusionNN, IntermediateFusionNN, FrankensteinNN, CombinedNN
+from cf_lib.multimodal import (
+    EarlyFusionNN,
+    IntermediateFusionNN,
+    ModalityWisePrototypeSynthesis,
+    MPS,
+    MultimodalConsensusRetrieval,
+    MCR,
+)
 
 __all__ = [
     "MultimodalDataset",
@@ -60,8 +67,10 @@ __all__ = [
     "ImageNN",
     "EarlyFusionNN",
     "IntermediateFusionNN",
-    "FrankensteinNN",
-    "CombinedNN",
+    "ModalityWisePrototypeSynthesis",
+    "MPS",
+    "MultimodalConsensusRetrieval",
+    "MCR",
 ]
 
 
@@ -82,8 +91,8 @@ class CounterfactualLibrary:
             "Tabular":       TabularNN(k=50),
             "Time Series 1": TimeSeriesNN("ts1", k=50),
             "Time Series 2": TimeSeriesNN("ts2", k=50),
-            "Frankenstein":  FrankensteinNN(),
-            "Combined":      CombinedNN(),
+            "MPS":           ModalityWisePrototypeSynthesis(),
+            "MC-R":          MultimodalConsensusRetrieval(),
         })
         results = lib.generate(dataset, sample_idx=7, target_value=0)
     """
@@ -205,7 +214,7 @@ class CounterfactualLibrary:
         Returns
         -------
         pc : dict
-            Forwarded to FrankensteinNN / CombinedNN so they skip repeated
+            Forwarded to ModalityWisePrototypeSynthesis / MultimodalConsensusRetrieval so they skip repeated
             searches.  Keys include ``"tabular"``, one key per
             ``TimeSeriesNN.ts_name``, and tuple keys of the form
             ``("text", text_name)`` / ``("image", image_name)``.
@@ -334,9 +343,9 @@ class CounterfactualLibrary:
         """Run all registered generators for a single test sample.
 
         If any unimodal generators (TabularNN, TimeSeriesNN, TextNN) are
-        registered alongside FrankensteinNN or CombinedNN, their search results
-        are automatically reused — the compound generators will not repeat the
-        same NN searches.
+        registered alongside ModalityWisePrototypeSynthesis or
+        MultimodalConsensusRetrieval, their search results are automatically
+        reused — the compound generators will not repeat the same NN searches.
 
         Parameters
         ----------
@@ -351,7 +360,7 @@ class CounterfactualLibrary:
         dict mapping each generator name to its list of candidate dicts.
         Generators that raise an exception are skipped (entry is empty list).
         """
-        _compound_types = (FrankensteinNN, CombinedNN)
+        _compound_types = (ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval)
         _unimodal_types = (TabularNN, TimeSeriesNN, TextNN, ImageNN)
         has_compound = any(isinstance(g, _compound_types) for g in self.generators.values())
         has_unimodal = any(isinstance(g, _unimodal_types) for g in self.generators.values())
@@ -409,7 +418,7 @@ class CounterfactualLibrary:
         -------
         dict mapping each sample_idx to the per-generator result dict.
         """
-        _compound_types = (FrankensteinNN, CombinedNN)
+        _compound_types = (ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval)
         _unimodal_types = (TabularNN, TimeSeriesNN, TextNN, ImageNN)
         has_compound = any(isinstance(g, _compound_types) for g in self.generators.values())
         has_unimodal = any(isinstance(g, _unimodal_types) for g in self.generators.values())

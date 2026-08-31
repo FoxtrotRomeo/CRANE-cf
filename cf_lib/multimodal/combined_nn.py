@@ -1,4 +1,4 @@
-"""Combined (joint-modality) nearest-neighbour counterfactual generator."""
+"""Multimodal Consensus Retrieval (MC-R): joint-modality nearest-neighbour counterfactual generator."""
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
@@ -16,7 +16,7 @@ from cf_lib.counterfactual_helpers import (
 from cf_lib.base import CounterfactualGenerator
 
 
-class CombinedNN(CounterfactualGenerator):
+class MultimodalConsensusRetrieval(CounterfactualGenerator):
     """Nearest-neighbour counterfactuals with joint inter-modality agreement.
 
     Runs separate unimodal NN searches for each present modality (static
@@ -354,7 +354,11 @@ class CombinedNN(CounterfactualGenerator):
                 active_idx_dist[cache_key] = (idx_image, dist_image)
 
         if not active_idx_dist:
-            print("[CombinedNN] no modalities available for this dataset — returning empty candidates.")
+            print("[MultimodalConsensusRetrieval] no modalities available for this dataset — returning empty candidates.")
             return []
 
         return self._combined_partial(active_idx_dist, sample_idx, k, dataset)
+
+
+# Short alias matching the paper's abbreviation (MC-R).
+MCR = MultimodalConsensusRetrieval

@@ -48,7 +48,7 @@ from sklearn.neighbors import LocalOutlierFactor
 from tweet_cf_factory import build_tweet_dataset
 from run_distance_ablation import run_distance_ablation
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.multimodal import FrankensteinNN, CombinedNN, EarlyFusionNN
+from cf_lib.multimodal import ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval, EarlyFusionNN
 from cf_lib.unimodal import TabularNN
 from cf_lib.counterfactual_helpers import find_k_closest_latent
 
@@ -317,11 +317,11 @@ def _make_generators_factory(include_intermediate_fusion: bool,
         dist_fn  = _metric_to_dist_fn(tab_m)
 
         extras = {
-            "Frankenstein": FrankensteinNN(
+            "MPS": ModalityWisePrototypeSynthesis(
                 k=args.k, k_search=_k_search,
                 static_dist_fn=dist_fn, e5_embed_fn=embed_fn,
             ),
-            "Combined": CombinedNN(
+            "MC-R": MultimodalConsensusRetrieval(
                 k=args.k, k_search=_k_search,
                 static_dist_fn=dist_fn, e5_embed_fn=embed_fn,
             ),

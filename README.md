@@ -4,6 +4,9 @@
   <img src="assets/CRANE.png" alt="CRANE-cf logo" width="300"/>
 </p>
 
+[![PyPI](https://img.shields.io/pypi/v/crane-cf)](https://pypi.org/project/crane-cf/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 **Counterfactual Retrieval via Agnostic Nearest-neighbour Explanations**
 
 `CRANE` generates counterfactual explanations for multimodal classifiers by searching for the closest opposite-class training samples in configurable distance spaces. It supports tabular, time-series, text, and image modalities, including multiple named branches of the same modality type, and provides several combination strategies.
@@ -22,27 +25,34 @@ CRANE is described in *CRANE: Post-Hoc Counterfactual Retrieval for Multimodal C
 
 ## Installation
 
-Clone the repository and install the core dependencies:
-
 ```bash
-git clone https://github.com/FoxtrotRomeo/CRANE-cf.git
-cd CRANE-cf
-pip install .
+pip install crane-cf
 ```
 
 For text encoder support (E5, BERT, Word2Vec) and Intermediate-Fusion:
 
 ```bash
-pip install ".[text,model]"
+pip install "crane-cf[text,model]"
 ```
 
 For image encoder support (ResNet-50, EfficientNet-B0, CLIP):
 
 ```bash
-pip install ".[image]"
+pip install "crane-cf[image]"
 # For CLIP: pip install git+https://github.com/openai/CLIP.git
 ```
 
+### From source
+
+To reproduce the experiments in the paper, clone the repository — the
+per-dataset scripts under `long_covid_tweets/`, `real_or_fake_jobs/`,
+`memes/`, and `sepsis/` are not shipped in the PyPI package:
+
+```bash
+git clone https://github.com/FoxtrotRomeo/CRANE-cf.git
+cd CRANE-cf
+pip install -e ".[text,model,image]"
+```
 ---
 
 ## Quickstart
@@ -50,7 +60,7 @@ pip install ".[image]"
 ```python
 from cf_lib import MultimodalDataset, CounterfactualLibrary
 from cf_lib.unimodal import TabularNN, TimeSeriesNN, TextNN, ImageNN
-from cf_lib.multimodal import FrankensteinNN, CombinedNN
+from cf_lib.multimodal import ModalityWisePrototypeSynthesis, MultimodalConsensusRetrieval
 
 dataset = MultimodalDataset(
     y_train=y_train,                 # np.ndarray (n_train,)  — only required field
@@ -74,8 +84,8 @@ lib = CounterfactualLibrary(
         "Meds TS":       TimeSeriesNN("meds", k=50),
         "Notes":         TextNN(text_name="notes", k=50, text_encoder="tfidf"),
         "Image":         ImageNN(image_name="cxr", k=50, image_encoder="resnet50"),
-        "Frankenstein":  FrankensteinNN(image_encoder="resnet50"),
-        "Combined":      CombinedNN(image_encoder="resnet50"),
+        "MPS":           ModalityWisePrototypeSynthesis(image_encoder="resnet50"),
+        "MC-R":          MultimodalConsensusRetrieval(image_encoder="resnet50"),
     }
 )
 
@@ -104,8 +114,12 @@ results = lib.generate(dataset, sample_idx=3, target_value=0)
 |---|---|
 | `EarlyFusionNN` | NN in the concatenated multimodal feature space across all named tabular, TS, text, and image branches |
 | `IntermediateFusionNN` | NN in a latent space provided explicitly via precomputed train/test latents or `latent_fn`; legacy Keras fallback retained |
-| `FrankensteinNN` | Independent per-modality searches; assembled by combining the best neighbours from each |
-| `CombinedNN` | Per-modality searches intersected by shared candidates, ranked by summed distance |
+| `ModalityWisePrototypeSynthesis` | Independent per-modality searches; assembled by combining the best neighbours from each |
+| `MultimodalConsensusRetrieval` | Per-modality searches intersected by shared candidates, ranked by summed distance |
+
+Paper terminology (Rugolon et al., DSAA 2026): `EarlyFusionNN` = EF-NN,
+`IntermediateFusionNN` = IF-NN, `ModalityWisePrototypeSynthesis` = MPS,
+`MultimodalConsensusRetrieval` = MC-R.
 
 ---
 

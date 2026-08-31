@@ -48,7 +48,7 @@ import json
 from hateful_memes_cf_factory import build_hateful_memes_dataset
 from run_distance_ablation import run_distance_ablation
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.multimodal import CombinedNN, EarlyFusionNN, FrankensteinNN, IntermediateFusionNN
+from cf_lib.multimodal import MultimodalConsensusRetrieval, EarlyFusionNN, ModalityWisePrototypeSynthesis, IntermediateFusionNN
 from cf_lib.counterfactual_evaluation_helpers import (
     _make_embed_fn_from_e5_kwargs,
     fit_image_lof,
@@ -687,13 +687,13 @@ def _make_generators_factory(k, k_search, include_if, train_latents, test_latent
         i_pre       = _precomputed_image_by_enc.get(i_enc, {})
 
         gens = {
-            "Frankenstein": FrankensteinNN(
+            "MPS": ModalityWisePrototypeSynthesis(
                 k=k, k_search=k_search,
                 e5_embed_fn=text_efn,
                 image_encoder=i_enc, img_distance_metric=i_metric,
                 img_device=DEVICE, img_batch_size=args.image_batch_size,
             ),
-            "Combined": CombinedNN(
+            "MC-R": MultimodalConsensusRetrieval(
                 k=k, k_search=k_search,
                 e5_embed_fn=text_efn,
                 image_encoder=i_enc, img_distance_metric=i_metric,

@@ -40,6 +40,11 @@ METRIC_LABELS = {
 STRATEGY_COLORS = ["#2c7bb6", "#d7191c", "#1a9641"]
 BAR_COLOR_MISSING = "#aaaaaa"
 
+# summary.json files saved before the MPS/MC-R rename used the old generator
+# names ("Frankenstein"/"Combined") as dict keys — fall back to those so
+# pre-existing ablation runs still plot.
+LEGACY_GEN_KEY_ALIASES = {"MPS": "Frankenstein", "MC-R": "Combined"}
+
 # ---------------------------------------------------------------------------
 # Per-dataset specs
 # ---------------------------------------------------------------------------
@@ -58,16 +63,16 @@ DATASETS: Dict[str, dict] = {
         "generators": [
             "Tabular",
             "TS[lab_exams_vitals]",
-            "Frankenstein",
-            "Combined",
+            "MPS",
+            "MC-R",
             "EarlyFusion",
             "IntermediateFusion",
         ],
         "gen_short": {
             "Tabular":            "Tab",
             "TS[lab_exams_vitals]": "TS",
-            "Frankenstein":       "Frank",
-            "Combined":           "Comb",
+            "MPS":       "MPS",
+            "MC-R":           "MC-R",
             "EarlyFusion":        "EFus",
             "IntermediateFusion": "IntFus",
         },
@@ -85,16 +90,16 @@ DATASETS: Dict[str, dict] = {
         "generators": [
             "Tabular",
             "Text",
-            "Frankenstein",
-            "Combined",
+            "MPS",
+            "MC-R",
             "EarlyFusion",
             "IntermediateFusion",
         ],
         "gen_short": {
             "Tabular":            "Tab",
             "Text":               "Text",
-            "Frankenstein":       "Frank",
-            "Combined":           "Comb",
+            "MPS":       "MPS",
+            "MC-R":           "MC-R",
             "EarlyFusion":        "EFus",
             "IntermediateFusion": "IntFus",
         },
@@ -114,8 +119,8 @@ DATASETS: Dict[str, dict] = {
             "Text",
             "Text_company_profile",
             "Text_requirements",
-            "Frankenstein",
-            "Combined",
+            "MPS",
+            "MC-R",
             "EarlyFusion",
             "IntermediateFusion",
         ],
@@ -124,8 +129,8 @@ DATASETS: Dict[str, dict] = {
             "Text":                  "Text",
             "Text_company_profile":  "Text[co]",
             "Text_requirements":     "Text[req]",
-            "Frankenstein":          "Frank",
-            "Combined":              "Comb",
+            "MPS":          "MPS",
+            "MC-R":              "MC-R",
             "EarlyFusion":           "EFus",
             "IntermediateFusion":    "IntFus",
         },
@@ -143,16 +148,16 @@ DATASETS: Dict[str, dict] = {
         "generators": [
             "Text",
             "Image",
-            "Frankenstein",
-            "Combined",
+            "MPS",
+            "MC-R",
             "EarlyFusion",
             "IntermediateFusion",
         ],
         "gen_short": {
             "Text":               "Text",
             "Image":              "Img",
-            "Frankenstein":       "Frank",
-            "Combined":           "Comb",
+            "MPS":       "MPS",
+            "MC-R":           "MC-R",
             "EarlyFusion":        "EFus",
             "IntermediateFusion": "IntFus",
         },
@@ -197,7 +202,7 @@ def load_strategy_data(cfg: dict) -> pd.DataFrame:
                     continue
                 objectives = row.get("objectives", {})
                 for gen in generators:
-                    obj = objectives.get(gen)
+                    obj = objectives.get(gen) or objectives.get(LEGACY_GEN_KEY_ALIASES.get(gen))
                     if not obj:
                         continue
                     rec = {
@@ -237,12 +242,13 @@ def load_strategy_flip_rate(cfg: dict) -> pd.DataFrame:
                     continue
                 counts = row.get("candidate_counts", {})
                 for gen in generators:
+                    count = counts.get(gen, counts.get(LEGACY_GEN_KEY_ALIASES.get(gen), 0))
                     records.append({
                         "strategy":  strategy,
                         "generator": gen,
                         "combo_id":  row.get("combo_id"),
                         "fold":      fold,
-                        "flip_rate": 1.0 if counts.get(gen, 0) > 0 else 0.0,
+                        "flip_rate": 1.0 if count > 0 else 0.0,
                     })
 
     return pd.DataFrame(records)

@@ -8,7 +8,7 @@ Three separate FieldTextNN generators are run per combo — one for each text
 field (description, company_profile, requirements) — so the ablation shows
 which field drives the best counterfactuals.
 
-MultiFieldFrankensteinNN runs 4 independent NN branches (tabular + desc +
+MultiFieldModalityWisePrototypeSynthesis runs 4 independent NN branches (tabular + desc +
 profile + reqs) with no intersection.  Candidate i draws its static features
 from the median of the tabular-NN top-i neighbours, its description from
 desc-NN[i], its company_profile from profile-NN[i], and its requirements from
@@ -16,7 +16,7 @@ reqs-NN[i] (chimeric).  All three text fields are stored explicitly in every
 candidate dict and passed directly to predict_fn — no training-set lookup is
 required.
 
-MultiFieldCombinedNN intersects all four independent candidate sets (tabular ∩
+MultiFieldMultimodalConsensusRetrieval intersects all four independent candidate sets (tabular ∩
 desc ∩ profile ∩ reqs) and selects a single consistent training sample,
 ranked by summed distance.  No chimeric mixing.
 
@@ -69,7 +69,7 @@ from sklearn.metrics.pairwise import euclidean_distances, manhattan_distances
 from job_cf_factory import build_job_dataset
 from run_distance_ablation import run_distance_ablation  # from examples/
 from cf_lib.base import CounterfactualGenerator
-from cf_lib.multimodal import CombinedNN, EarlyFusionNN
+from cf_lib.multimodal import MultimodalConsensusRetrieval, EarlyFusionNN
 from cf_lib.unimodal import TabularNN, TextNN
 from cf_lib.counterfactual_helpers import find_k_closest_latent, find_k_closest_static
 from cf_lib.counterfactual_evaluation_helpers import fit_proximity_normalizer
@@ -92,7 +92,7 @@ parser.add_argument("--n-jobs",            type=int, default=4,
 parser.add_argument("--output-dir",        type=str, default="data/ablation_runs")
 parser.add_argument("--run-name",          type=str, default=None)
 parser.add_argument("--k-search-combined", type=int, default=300,
-                    help="k_search pool size for Frankenstein and Combined generators (default: 300).")
+                    help="k_search pool size for MPS and MC-R generators (default: 300).")
 parser.add_argument("--fusion-strategy",   type=str, default="intermediate",
                     choices=["intermediate", "early", "late"],
                     help="Which fusion model to use for predict_fn / latents. "
@@ -447,7 +447,7 @@ def _run_embedding_nn_search(
     """Find k_search nearest neighbours in a pre-computed embedding space.
 
     Returns (idx_dict, dist_dict) keyed by sample_idx, compatible with the
-    precomputed interface of FrankensteinNN / CombinedNN.
+    precomputed interface of ModalityWisePrototypeSynthesis / MultimodalConsensusRetrieval.
     """
     candidate_idx = np.flatnonzero(np.asarray(y_train) == target_value)
     query         = emb_test[[sample_idx]]
@@ -501,10 +501,10 @@ def _run_embedding_nn_search_batch(
 
 
 # ---------------------------------------------------------------------------
-# MultiFieldFrankensteinNN — 4 independent branches: tabular + desc + profile + reqs
+# MultiFieldModalityWisePrototypeSynthesis — 4 independent branches: tabular + desc + profile + reqs
 # ---------------------------------------------------------------------------
-class MultiFieldFrankensteinNN(CounterfactualGenerator):
-    """Frankenstein with 4 independent NN branches: tabular + desc + profile + reqs.
+class MultiFieldModalityWisePrototypeSynthesis(CounterfactualGenerator):
+    """MPS with 4 independent NN branches: tabular + desc + profile + reqs.
 
     Static component : median of tabular-NN[1..i] per candidate (synthetic,
                        independent from the text component).
@@ -639,10 +639,10 @@ class MultiFieldFrankensteinNN(CounterfactualGenerator):
 
 
 # ---------------------------------------------------------------------------
-# MultiFieldCombinedNN — intersection of 4 independent searches
+# MultiFieldMultimodalConsensusRetrieval — intersection of 4 independent searches
 # ---------------------------------------------------------------------------
-class MultiFieldCombinedNN(CombinedNN):
-    """CombinedNN with 4 independent searches: tabular + desc + profile + reqs.
+class MultiFieldMultimodalConsensusRetrieval(MultimodalConsensusRetrieval):
+    """MultimodalConsensusRetrieval with 4 independent searches: tabular + desc + profile + reqs.
 
     Intersects all four candidate sets (tabular ∩ desc-text ∩ profile-text ∩
     reqs-text) and ranks the common training samples by summed distance across
@@ -935,8 +935,8 @@ if _pt_path.exists():
         )
 
         # Precompute model predictions for all training samples in one batched pass.
-        # Unimodal / Combined / EarlyFusion / IntermediateFusion candidates are pure
-        # training samples — exact cache hits.  Only MultiFieldFrankensteinNN assembles
+        # Unimodal / MC-R / EarlyFusion / IntermediateFusion candidates are pure
+        # training samples — exact cache hits.  Only MultiFieldModalityWisePrototypeSynthesis assembles
         # hybrids (tabular median + texts from three independent branches), so those
         # miss the cache and fall through to serialized live inference.
         print("Precomputing model predictions for all training samples …")
@@ -1007,7 +1007,7 @@ if _pt_path.exists():
                 if _hit is not None:
                     return _hit
 
-            # Cache miss: Frankenstein hybrid — serialized live inference.
+            # Cache miss: MPS hybrid — serialized live inference.
             def _enc(t):
                 return _tok([t], max_length=512, padding="max_length",
                             truncation=True, return_tensors="pt")
@@ -1111,7 +1111,7 @@ if _fusion_strategy == "early":
                     _hit = _cache.get(_key)
                     if _hit is not None:
                         return _hit
-                # Cache miss: encode live (Frankenstein hybrid)
+                # Cache miss: encode live (MPS hybrid)
                 with _lock:
                     e_d = _embed([desc])[0]
                     e_p = _embed([profile])[0]
@@ -1303,7 +1303,7 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
     def _text_modalities_fn(sample_idx, cand, text_factual):
         """Return text_modalities covering all 3 text fields for this candidate.
 
-        Chimeric Frankenstein candidates store company_profile and requirements
+        Chimeric MPS candidates store company_profile and requirements
         explicitly in the candidate dict (independently selected per-branch).
         All other generators select a single training sample, so profile/reqs
         are looked up from source_train_idx.
@@ -1311,7 +1311,7 @@ def _objectives_kwargs_factory(text_cfg, image_cfg):
         cand_desc = str(cand.get("text") or "")
 
         if "company_profile" in cand:
-            # Explicitly stored (Frankenstein chimeric or Combined annotated)
+            # Explicitly stored (MPS chimeric or MC-R annotated)
             cand_profile = str(cand["company_profile"] or "")
             cand_reqs    = str(cand.get("requirements") or "")
         else:
@@ -1405,10 +1405,10 @@ def _multimodal_generators_factory(
         )
         extras[f"Text_{fname}"] = FieldTextNN(fname, ftrain, ftest, inner, X_train_description)
 
-    # ---- Frankenstein: 4 independent branches (tabular + desc + profile + reqs) ----
+    # ---- MPS: 4 independent branches (tabular + desc + profile + reqs) ----
     # Static from tabular-NN[i]; each text field from its own NN[i] independently.
     if pre_desc is not None and pre_profile is not None and pre_reqs is not None:
-        extras["Frankenstein"] = MultiFieldFrankensteinNN(
+        extras["MPS"] = MultiFieldModalityWisePrototypeSynthesis(
             pre_desc    = pre_desc,
             pre_profile = pre_profile,
             pre_reqs    = pre_reqs,
@@ -1419,9 +1419,9 @@ def _multimodal_generators_factory(
             static_dist_fn = static_dist,
         )
 
-    # ---- Combined: intersection of 4 sets (tabular ∩ desc ∩ profile ∩ reqs) ----
+    # ---- MC-R: intersection of 4 sets (tabular ∩ desc ∩ profile ∩ reqs) ----
     if pre_desc is not None and pre_profile is not None and pre_reqs is not None:
-        extras["Combined"] = MultiFieldCombinedNN(
+        extras["MC-R"] = MultiFieldMultimodalConsensusRetrieval(
             pre_desc    = pre_desc,
             pre_profile = pre_profile,
             pre_reqs    = pre_reqs,
