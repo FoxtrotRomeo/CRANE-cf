@@ -10,9 +10,9 @@
 
 ## Authors
 
-- **Franco Rugolon** — [ORCID 0000-0002-7693-0576](https://orcid.org/0000-0002-7693-0576)
-- **Ioanna Miliou** — [ORCID 0000-0002-1357-1967](https://orcid.org/0000-0002-1357-1967)
-- **Panagiotis Papapetrou** — [ORCID 0000-0002-4632-4815](https://orcid.org/0000-0002-4632-4815)
+- **Franco Rugolon** - [ORCID 0000-0002-7693-0576](https://orcid.org/0000-0002-7693-0576)
+- **Ioanna Miliou** - [ORCID 0000-0002-1357-1967](https://orcid.org/0000-0002-1357-1967)
+- **Panagiotis Papapetrou** - [ORCID 0000-0002-4632-4815](https://orcid.org/0000-0002-4632-4815)
 
 Department of Computer and Systems Sciences, Stockholm University, Sweden.
 
