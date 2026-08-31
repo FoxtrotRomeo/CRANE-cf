@@ -13,18 +13,18 @@ authors:
     given-names: "Franco"
     affiliation: "Stockholm University, Department of Computer and Systems Sciences"
     orcid: "https://orcid.org/0000-0002-7693-0576"
-- family-names: "Miliou"
+  - family-names: "Miliou"
     given-names: "Ioanna"
     affiliation: "Stockholm University, Department of Computer and Systems Sciences"
     orcid: "https://orcid.org/0000-0002-1357-1967"
-- family-names: "Papapetrou"
+  - family-names: "Papapetrou"
     given-names: "Panagiotis"
     affiliation: "Stockholm University, Department of Computer and Systems Sciences"
     orcid: "https://orcid.org/0000-0002-4632-4815"
 date-released: "2026-03-10"
 version: "0.1.0"
 license: Apache-2.0
-repository-code: "https://github.com/FoxtrotRomeo/cf-lib"
+repository-code: "https://github.com/FoxtrotRomeo/CRANE-cf"
 keywords:
   - counterfactual explanations
   - explainability
