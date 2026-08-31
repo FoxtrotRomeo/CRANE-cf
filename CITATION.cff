@@ -1,13 +1,18 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
+message: "If you use this software, please cite both the software and the paper below."
 type: software
-title: "CRANE: Post-Hoc Counterfactual Retrieval for Multimodal Classifiers"
+title: "CRANE: Counterfactual Retrieval via Agnostic Nearest-neighbour Explanations"
 abstract: >
-  cf-lib is a Python library for generating nearest-neighbour counterfactual
-  explanations for multimodal classifiers. It supports tabular, time-series,
-  and text modalities, and provides unimodal generators (TabularNN,
-  TimeSeriesNN, TextNN) as well as multimodal strategies (EF-NN,
-  IF-NN, MPS, MC-R).
+  CRANE is a Python library for generating post-hoc, model-agnostic
+  nearest-neighbour counterfactual explanations for multimodal classifiers.
+  It supports tabular, time-series, text, and image modalities, including
+  multiple named branches of the same modality type, and provides unimodal
+  generators (TabularNN, TimeSeriesNN, TextNN, ImageNN) as well as
+  multimodal retrieval strategies: Early-Fusion Nearest Neighbour (EF-NN),
+  Intermediate-Fusion Nearest Neighbour (IF-NN), Multimodal Consensus
+  Retrieval (MC-R), and Modality-wise Prototype Synthesis (MPS). Candidates
+  are evaluated against four objectives: validity, proximity, sparsity, and
+  plausibility.
 authors:
   - family-names: "Rugolon"
     given-names: "Franco"
@@ -21,14 +26,44 @@ authors:
     given-names: "Panagiotis"
     affiliation: "Stockholm University, Department of Computer and Systems Sciences"
     orcid: "https://orcid.org/0000-0002-4632-4815"
-date-released: "2026-03-10"
+date-released: 2026-03-10
 version: "0.1.0"
 license: Apache-2.0
 repository-code: "https://github.com/FoxtrotRomeo/CRANE-cf"
+url: "https://github.com/FoxtrotRomeo/CRANE-cf"
 keywords:
   - counterfactual explanations
-  - explainability
-  - multimodal
+  - explainable artificial intelligence
+  - multimodal learning
   - nearest neighbours
+  - post-hoc explanation
   - time series
   - natural language processing
+  - computer vision
+preferred-citation:
+  type: conference-paper
+  title: "CRANE: Post-Hoc Counterfactual Retrieval for Multimodal Classifiers"
+  authors:
+    - family-names: "Rugolon"
+      given-names: "Franco"
+      affiliation: "Stockholm University, Department of Computer and Systems Sciences"
+      orcid: "https://orcid.org/0000-0002-7693-0576"
+    - family-names: "Miliou"
+      given-names: "Ioanna"
+      affiliation: "Stockholm University, Department of Computer and Systems Sciences"
+      orcid: "https://orcid.org/0000-0002-1357-1967"
+    - family-names: "Papapetrou"
+      given-names: "Panagiotis"
+      affiliation: "Stockholm University, Department of Computer and Systems Sciences"
+      orcid: "https://orcid.org/0000-0002-4632-4815"
+  collection-title: "Proceedings of the 13th IEEE International Conference on Data Science and Advanced Analytics (DSAA)"
+  conference:
+    name: "13th IEEE International Conference on Data Science and Advanced Analytics (DSAA'2026)"
+    city: "New Delhi"
+    country: "IN"
+    date-start: 2026-10-06
+    date-end: 2026-10-09
+  publisher:
+    name: "IEEE"
+  year: 2026
+  month: 10
