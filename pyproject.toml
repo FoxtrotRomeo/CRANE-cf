@@ -15,13 +15,15 @@ dependencies = [
     "numpy>=1.24",
     "scikit-learn>=1.3",
     "aeon>=0.9",          # DTW and other time-series distances
+    "torch>=2.0",
+    "pandas>=1.5",
+    "tqdm>=4.65",
 ]
 
 [project.optional-dependencies]
 # Text encoders (E5 / BERT / Word2Vec)
 text = [
     "transformers>=4.35",
-    "torch>=2.0",
     "gensim>=4.3",
     "rouge-score>=0.1",
     "nltk>=3.8",

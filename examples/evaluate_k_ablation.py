@@ -59,7 +59,7 @@ if __package__ in {None, ""}:
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-from counterfactual_evaluation_helpers import compute_objectives
+from cf_lib.counterfactual_evaluation_helpers import compute_objectives
 from run_distance_ablation import _json_default
 
 

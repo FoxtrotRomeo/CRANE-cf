@@ -1,11 +1,7 @@
 """Early-Fusion nearest-neighbour counterfactual generator."""
 from __future__ import annotations
 
-import pathlib
-import sys
 from typing import Any, Callable, Dict, List, Optional
-
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
 
 import numpy as np
 from sklearn.metrics import pairwise_distances
@@ -102,10 +98,7 @@ class EarlyFusionNN(CounterfactualGenerator):
         strs = ["" if t is None else str(t) for t in np.asarray(texts, dtype=object).reshape(-1)]
         if self.e5_embed_fn is not None:
             return np.asarray(self.e5_embed_fn(strs), dtype=float)
-        try:
-            from counterfactual_evaluation_helpers import embed_e5
-        except ImportError:
-            from counterfactual_evaluation_helpers import embed_e5
+        from cf_lib.counterfactual_evaluation_helpers import embed_e5
         return np.asarray(
             embed_e5(strs, tokenizer=self.e5_tokenizer, model=self.e5_model, device=self.e5_device),
             dtype=float,
@@ -113,7 +106,7 @@ class EarlyFusionNN(CounterfactualGenerator):
 
     def _embed_image(self, images) -> np.ndarray:
         """Return image embeddings using the configured encoder."""
-        from counterfactual_helpers import _build_image_representations
+        from cf_lib.counterfactual_helpers import _build_image_representations
         emb, _ = _build_image_representations(
             images, images,   # only train embeddings needed; test handled separately
             image_encoder=self.image_encoder,
@@ -156,7 +149,7 @@ class EarlyFusionNN(CounterfactualGenerator):
         if enc != "precomputed":
             return True
         # Pre-computed: check that data is already a 2-D float array.
-        from counterfactual_helpers import _is_image_precomputed
+        from cf_lib.counterfactual_helpers import _is_image_precomputed
         return any(
             _is_image_precomputed(img)
             for img in dataset.image_modalities("train").values()
@@ -355,7 +348,7 @@ class EarlyFusionNN(CounterfactualGenerator):
         use_img = self._has_image_support(dataset)
         pre_img_train, pre_img_test = self._resolve_precomputed_image_dicts()
         if use_img:
-            from counterfactual_helpers import _build_image_representations
+            from cf_lib.counterfactual_helpers import _build_image_representations
             if pre_img_train is not None and pre_img_test is not None:
                 img_emb_train = {
                     name: np.asarray(arr, dtype=float)
@@ -535,7 +528,7 @@ class EarlyFusionNN(CounterfactualGenerator):
         use_img = self._has_image_support(dataset)
         pre_img_train, pre_img_test = self._resolve_precomputed_image_dicts()
         if use_img:
-            from counterfactual_helpers import _build_image_representations
+            from cf_lib.counterfactual_helpers import _build_image_representations
             if pre_img_train is not None and pre_img_test is not None:
                 img_emb_train = {
                     name: np.asarray(arr, dtype=float)

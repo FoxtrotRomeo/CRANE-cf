@@ -43,11 +43,6 @@ pip install ".[image]"
 # For CLIP: pip install git+https://github.com/openai/CLIP.git
 ```
 
-> **Note:** the helper modules (`counterfactual_helpers.py`,
-> `counterfactual_evaluation_helpers.py`) must remain at the repository root
-> alongside the `cf_lib/` package. When running scripts (e.g. from
-> `examples/`), do so from the repository root so Python can find them.
-
 ---
 
 ## Quickstart
@@ -241,7 +236,9 @@ The `examples/` directory contains generic tooling:
   files at multiple k values without re-running NN search, by slicing the
   pre-sorted candidate lists.
 
-Run from the **repository root**:
+The commands below assume you're invoking from the **repository root** (that's
+what the relative script paths refer to); adjust the paths if running from
+elsewhere:
 
 ```bash
 # Smoke test with synthetic data (includes image embeddings)

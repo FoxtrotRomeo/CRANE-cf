@@ -1,16 +1,12 @@
 """Generic time-series nearest-neighbour counterfactual generator."""
 from __future__ import annotations
 
-import pathlib
-import sys
 from typing import Any, Callable, Dict, List, Optional
-
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
 
 import numpy as np
 from aeon.distances import dtw_distance
 
-from counterfactual_helpers import find_k_closest_ts
+from cf_lib.counterfactual_helpers import find_k_closest_ts
 from cf_lib.base import CounterfactualGenerator
 
 

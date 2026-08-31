@@ -55,8 +55,8 @@ from run_distance_ablation import run_distance_ablation  # from examples/
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import FrankensteinNN, CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN
-from counterfactual_helpers import find_k_closest_latent
-from counterfactual_evaluation_helpers import fit_proximity_normalizer
+from cf_lib.counterfactual_helpers import find_k_closest_latent
+from cf_lib.counterfactual_evaluation_helpers import fit_proximity_normalizer
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -643,14 +643,14 @@ if args.word2vec_path is not None:
 # — bert (already loaded in text_bk when not --no-bert) —
 _bert_embed_fn: Optional[object] = None
 if not args.no_bert:
-    from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK, _make_embed_fn_from_e5_kwargs
+    from cf_lib.counterfactual_evaluation_helpers import _HF_BACKEND_LOCK, _make_embed_fn_from_e5_kwargs
     _bert_embed_fn = _make_embed_fn_from_e5_kwargs(
         tokenizer = text_bk["bert_tokenizer"],
         model     = text_bk["bert_model"],
         device    = text_bk["bert_device"],
     )
 else:
-    from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
+    from cf_lib.counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
 
 
 def _precompute_text_embeddings_once(name: str, embed_fn) -> Dict[str, np.ndarray]:

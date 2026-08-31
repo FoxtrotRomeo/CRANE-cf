@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 
-from counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
+from .counterfactual_evaluation_helpers import _HF_BACKEND_LOCK
 
 def _validate_k(k: int) -> int:
     k_int = int(k)
@@ -276,10 +276,7 @@ def find_k_closest_EF(
     if e5_embed_fn is None:
         if e5_tokenizer is None or e5_model is None or e5_device is None:
             raise ValueError("Provide e5_embed_fn or e5_tokenizer/e5_model/e5_device.")
-        try:
-            from counterfactual_evaluation_helpers import embed_e5
-        except ImportError:
-            from .counterfactual_evaluation_helpers import embed_e5
+        from .counterfactual_evaluation_helpers import embed_e5
 
         def e5_embed_fn(texts):
             return embed_e5(texts, tokenizer=e5_tokenizer, model=e5_model, device=e5_device)
@@ -1288,10 +1285,7 @@ def _build_text_representations(
                 raise ValueError(
                     "E5 encoding requires e5_embed_fn or e5_tokenizer/e5_model/e5_device."
                 )
-            try:
-                from counterfactual_evaluation_helpers import embed_e5
-            except ImportError:  # support package-style imports
-                from .counterfactual_evaluation_helpers import embed_e5
+            from .counterfactual_evaluation_helpers import embed_e5
 
             def embed_fn(texts):
                 return embed_e5(
@@ -3262,10 +3256,7 @@ from tqdm.auto import tqdm
 
 # Evaluation utilities live in a separate module; import them here so
 # `evaluate_methods_for_patient(s)` works when called from this module.
-try:
-    from counterfactual_evaluation_helpers import evaluate_counterfactuals, compute_tau_c, fit_plausibility_normalizer
-except ImportError:  # support package-style imports
-    from .counterfactual_evaluation_helpers import evaluate_counterfactuals, compute_tau_c, fit_plausibility_normalizer
+from .counterfactual_evaluation_helpers import evaluate_counterfactuals, compute_tau_c, fit_plausibility_normalizer
 
 if "traceback" not in globals():
     import traceback

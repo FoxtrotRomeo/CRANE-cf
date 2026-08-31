@@ -28,8 +28,8 @@ from run_distance_ablation import run_distance_ablation
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import CombinedNN, EarlyFusionNN, FrankensteinNN
 from cf_lib.unimodal import TabularNN
-from counterfactual_evaluation_helpers import compute_tau_c, fit_plausibility_normalizer, fit_proximity_normalizer
-from counterfactual_helpers import find_k_closest_latent
+from cf_lib.counterfactual_evaluation_helpers import compute_tau_c, fit_plausibility_normalizer, fit_proximity_normalizer
+from cf_lib.counterfactual_helpers import find_k_closest_latent
 
 
 class _SepsisIFModel(nn.Module):

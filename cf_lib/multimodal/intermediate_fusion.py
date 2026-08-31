@@ -2,17 +2,13 @@
 from __future__ import annotations
 
 import inspect
-import pathlib
-import sys
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
-
 from sklearn.metrics.pairwise import euclidean_distances
 
-from counterfactual_helpers import find_k_closest_latent, find_k_closest_latent_model
+from cf_lib.counterfactual_helpers import find_k_closest_latent, find_k_closest_latent_model
 from cf_lib.base import CounterfactualGenerator
 
 
@@ -208,7 +204,7 @@ class IntermediateFusionNN(CounterfactualGenerator):
         if enc == "precomputed":
             import numpy as np
             return np.asarray(images, dtype=float)
-        from counterfactual_helpers import _build_image_representations
+        from cf_lib.counterfactual_helpers import _build_image_representations
         emb, _ = _build_image_representations(
             images, images,
             image_encoder=enc,

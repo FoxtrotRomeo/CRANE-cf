@@ -1,16 +1,12 @@
 """Tabular (static) nearest-neighbour counterfactual generator."""
 from __future__ import annotations
 
-import pathlib
-import sys
 from typing import Any, Callable, Dict, List, Optional
-
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
 
 import numpy as np
 from sklearn.metrics.pairwise import euclidean_distances
 
-from counterfactual_helpers import find_k_closest_static
+from cf_lib.counterfactual_helpers import find_k_closest_static
 from cf_lib.base import CounterfactualGenerator
 
 

@@ -46,12 +46,12 @@ for _p in [str(_ROOT), str(_ROOT / "examples")]:
 from hateful_memes_cf_factory import build_hateful_memes_dataset
 from run_distance_ablation import run_distance_ablation
 from cf_lib.multimodal import CombinedNN, EarlyFusionNN, FrankensteinNN, IntermediateFusionNN
-from counterfactual_evaluation_helpers import (
+from cf_lib.counterfactual_evaluation_helpers import (
     _make_embed_fn_from_e5_kwargs,
     fit_image_lof,
     fit_text_lof_reference,
 )
-from counterfactual_helpers import _apply_vision_encoder, _build_vision_encoder
+from cf_lib.counterfactual_helpers import _apply_vision_encoder, _build_vision_encoder
 from encoder_features import (
     DEFAULT_CACHE_PATH,
     FineTuneMultimodalClassifier,

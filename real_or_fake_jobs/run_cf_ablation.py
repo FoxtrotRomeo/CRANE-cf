@@ -71,8 +71,8 @@ from run_distance_ablation import run_distance_ablation  # from examples/
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN, TextNN
-from counterfactual_helpers import find_k_closest_latent, find_k_closest_static
-from counterfactual_evaluation_helpers import fit_proximity_normalizer
+from cf_lib.counterfactual_helpers import find_k_closest_latent, find_k_closest_static
+from cf_lib.counterfactual_evaluation_helpers import fit_proximity_normalizer
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -254,7 +254,7 @@ print(f"  Proximity ref dists: {len(_prox_norm.get('tab_ref_dists', []))} tabula
 # ---------------------------------------------------------------------------
 _bert_embed_fn: Optional[object] = None
 if not args.no_bert:
-    from counterfactual_evaluation_helpers import _make_embed_fn_from_e5_kwargs
+    from cf_lib.counterfactual_evaluation_helpers import _make_embed_fn_from_e5_kwargs
     _bert_embed_fn = _make_embed_fn_from_e5_kwargs(
         tokenizer = text_bk["bert_tokenizer"],
         model     = text_bk["bert_model"],

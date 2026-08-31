@@ -50,7 +50,7 @@ from run_distance_ablation import run_distance_ablation
 from cf_lib.base import CounterfactualGenerator
 from cf_lib.multimodal import FrankensteinNN, CombinedNN, EarlyFusionNN
 from cf_lib.unimodal import TabularNN
-from counterfactual_helpers import find_k_closest_latent
+from cf_lib.counterfactual_helpers import find_k_closest_latent
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -199,7 +199,7 @@ _italian_ft_embed_fn = None
 _w2v_embed_fn        = None
 
 if not args.no_bert:
-    from counterfactual_evaluation_helpers import _make_embed_fn_from_e5_kwargs
+    from cf_lib.counterfactual_evaluation_helpers import _make_embed_fn_from_e5_kwargs
     _bert_embed_fn = _make_embed_fn_from_e5_kwargs(
         tokenizer=text_bk["bert_tokenizer"],
         model=text_bk["bert_model"],

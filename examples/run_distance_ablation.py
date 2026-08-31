@@ -52,7 +52,7 @@ if __package__ in {None, ""}:
 
 from cf_lib import CounterfactualLibrary
 from cf_lib.unimodal import TabularNN, TimeSeriesNN, TextNN, ImageNN
-from counterfactual_evaluation_helpers import compute_objectives
+from cf_lib.counterfactual_evaluation_helpers import compute_objectives
 
 
 def _parse_csv(value: Optional[str]) -> List[str]:
