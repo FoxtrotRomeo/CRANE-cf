@@ -11,7 +11,7 @@ abstract: >
   multimodal retrieval strategies: Early-Fusion Nearest Neighbour (EF-NN),
   Intermediate-Fusion Nearest Neighbour (IF-NN), Multimodal Consensus
   Retrieval (MC-R), and Modality-wise Prototype Synthesis (MPS). Candidates
-  are evaluated against four objectives: validity, proximity, sparsity, and
+  are evaluated against four objectives: outcome, proximity, sparsity, and
   plausibility.
 authors:
   - family-names: "Rugolon"
